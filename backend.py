@@ -3,6 +3,11 @@ from flask_cors import CORS
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import sqlite3
+from flask_cors import CORS
+import datetime
+
+app = Flask(__name__)
+CORS(app, origins=['https://traderdashbord.onrender.com'])  # Add your React app's URL
 
 # --- IMPORTANT ---
 # Store your API keys securely. Using environment variables is a good practice.
@@ -87,8 +92,40 @@ def init_db():
     finally:
         conn.close()
 
+def clear_trades_if_new_month():
+    """Clears trades if a new month has started."""
+    conn = get_db_connection()
+    try:
+        # Create a table to store the last cleared month if it doesn't exist
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        conn.commit()
+
+        # Get the last cleared month
+        cur = conn.execute("SELECT value FROM meta WHERE key = 'last_cleared_month'")
+        row = cur.fetchone()
+        current_month = datetime.datetime.now().strftime('%Y-%m')
+        last_cleared_month = row['value'] if row else None
+
+        if last_cleared_month != current_month:
+            # Clear trades table
+            conn.execute('DELETE FROM trades')
+            conn.commit()
+            # Update last cleared month
+            conn.execute("REPLACE INTO meta (key, value) VALUES (?, ?)", ('last_cleared_month', current_month))
+            conn.commit()
+            print(f"Trades table cleared for new month: {current_month}")
+    except Exception as e:
+        print(f"Error clearing trades for new month: {e}")
+    finally:
+        conn.close()
 
 if __name__ == '__main__':
     init_db()
+    clear_trades_if_new_month()
     # Note: For production, use a proper WSGI server like Gunicorn or Waitress
     app.run(host='0.0.0.0', port=5000, debug=True)

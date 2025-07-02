@@ -209,3 +209,43 @@
 2025-07-02 20:34:23,654 - INFO - No trading signal
 2025-07-02 20:35:23,952 - INFO - Signal detected: BUY
 2025-07-02 20:36:24,806 - INFO - Signal detected: BUY
+2025-07-02 20:37:25,648 - INFO - Signal detected: BUY
+2025-07-02 20:38:26,528 - INFO - Signal detected: BUY
+2025-07-02 20:39:27,347 - INFO - Signal detected: BUY
+2025-07-02 20:40:28,158 - INFO - Signal detected: BUY
+2025-07-02 20:41:28,942 - INFO - Signal detected: BUY
+2025-07-02 20:42:29,880 - INFO - Signal detected: BUY
+2025-07-02 20:43:31,009 - INFO - Signal detected: BUY
+2025-07-02 20:44:32,605 - INFO - Signal detected: BUY
+2025-07-02 20:45:35,483 - INFO - Signal detected: BUY
+2025-07-02 20:46:36,800 - INFO - Signal detected: BUY
+2025-07-02 20:47:38,005 - INFO - Signal detected: BUY
+2025-07-02 20:48:38,865 - INFO - Signal detected: BUY
+2025-07-02 20:49:39,687 - INFO - Signal detected: BUY
+2025-07-02 20:50:40,526 - INFO - Signal detected: BUY
+2025-07-02 20:50:42,694 - INFO - Available balance: $23.06
+2025-07-02 20:50:42,695 - INFO - Usable capital (95%): $21.91
+2025-07-02 20:50:42,695 - INFO - Position value with 10x leverage: $219.06
+2025-07-02 20:50:42,696 - INFO - Position size: 1329.0 coins
+2025-07-02 20:50:44,809 - INFO - Opening LONG position at 0.16487
+2025-07-02 20:50:44,810 - INFO - Position size: 1329.0 DOGE
+2025-07-02 20:50:44,810 - INFO - Stop loss: 0.16157, Take profit: 0.16982
+2025-07-02 20:50:44,811 - INFO - WARNING: Using full capital with 10x leverage - HIGH RISK!
+2025-07-02 20:50:47,738 - INFO - Stop loss set at 0.16157: 75848394050
+2025-07-02 20:50:47,995 - INFO - Take profit set at 0.16982: 75848394477
+2025-07-02 20:50:47,996 - INFO - LONG position opened with order: 75848391777
+2025-07-02 20:51:48,244 - INFO - Signal detected: BUY
+2025-07-02 20:52:49,014 - INFO - Signal detected: BUY
+2025-07-02 20:53:49,759 - INFO - Signal detected: BUY
+2025-07-02 20:54:50,695 - INFO - Signal detected: BUY
+2025-07-02 20:55:51,513 - INFO - Signal detected: BUY
+2025-07-02 20:56:52,300 - INFO - Signal detected: BUY
+2025-07-02 20:57:53,112 - INFO - Signal detected: BUY
+2025-07-02 20:58:53,942 - INFO - Signal detected: BUY
+2025-07-02 20:59:54,947 - INFO - Signal detected: BUY
+2025-07-02 21:00:56,678 - INFO - Signal detected: BUY
+2025-07-02 21:01:57,533 - INFO - Signal detected: BUY
+2025-07-02 21:02:59,222 - INFO - Signal detected: BUY
+2025-07-02 21:04:00,659 - INFO - Signal detected: BUY
+2025-07-02 21:05:02,192 - INFO - Signal detected: BUY
+2025-07-02 21:06:03,035 - INFO - Signal detected: BUY
