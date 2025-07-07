@@ -26,6 +26,40 @@ def log_trade_to_db(symbol, side, quantity, entry_price, exit_price, profit):
         if conn:
             conn.close()
 
+# --- EXACT SIGNAL GENERATION LOGIC FROM FILE 1 ---
+def total_signal(df, current_candle):
+    """
+    Exact copy of signal generation logic from File 1 (Analysis Script)
+    """
+    current_pos = df.index.get_loc(current_candle)
+    if current_pos < 3:
+        return 0
+    
+    # Buy signal conditions (exactly as in File 1)
+    c1 = df['High'].iloc[current_pos] > df['High'].iloc[current_pos-1]
+    c2 = df['High'].iloc[current_pos-1] > df['Low'].iloc[current_pos]
+    c3 = df['Low'].iloc[current_pos] > df['High'].iloc[current_pos-2]
+    c4 = df['High'].iloc[current_pos-2] > df['Low'].iloc[current_pos-1]
+    c5 = df['Low'].iloc[current_pos-1] > df['High'].iloc[current_pos-3]
+    c6 = df['High'].iloc[current_pos-3] > df['Low'].iloc[current_pos-2]
+    c7 = df['Low'].iloc[current_pos-2] > df['Low'].iloc[current_pos-3]
+    
+    if c1 and c2 and c3 and c4 and c5 and c6 and c7:
+        return 2
+    
+    # Sell signal conditions (exactly as in File 1)
+    c1 = df['Low'].iloc[current_pos] < df['Low'].iloc[current_pos-1]
+    c2 = df['Low'].iloc[current_pos-1] < df['High'].iloc[current_pos]
+    c3 = df['High'].iloc[current_pos] < df['Low'].iloc[current_pos-2]
+    c4 = df['Low'].iloc[current_pos-2] < df['High'].iloc[current_pos-1]
+    c5 = df['High'].iloc[current_pos-1] < df['Low'].iloc[current_pos-3]
+    c6 = df['Low'].iloc[current_pos-3] < df['High'].iloc[current_pos-2]
+    c7 = df['High'].iloc[current_pos-2] < df['High'].iloc[current_pos-3]
+    
+    if c1 and c2 and c3 and c4 and c5 and c6 and c7:
+        return 1
+    
+    return 0
 
 # Set up logging
 logging.basicConfig(
@@ -43,10 +77,6 @@ class BinanceFuturesBot:
         self.client = Client(api_key, api_secret)
         self.current_position = None
         self.entry_price = 0
-
-    # ... (keep all your existing methods like setup_futures_account, get_signal, etc.) ...
-    # PASTE ALL YOUR METHODS FROM THE ORIGINAL trader.py HERE
-    # I will only show the methods that need modification.
 
     def setup_futures_account(self):
         """Set up the futures account with the specified leverage"""
@@ -214,7 +244,9 @@ class BinanceFuturesBot:
             return None
 
     def get_signal(self):
-        """Get the current trading signal"""
+        """
+        Get the current trading signal using EXACT same logic as File 1
+        """
         df = self.fetch_latest_candles(num_candles=4)
         if df is None or len(df) < 4:
             logger.error("Not enough candles to generate signal")
@@ -223,31 +255,18 @@ class BinanceFuturesBot:
         # Current candle is the last one in the dataframe
         current_candle = df.index[-1]
         
-        # Buy conditions
-        c1 = df['High'].iloc[-1] > df['High'].iloc[-2]
-        c2 = df['High'].iloc[-2] > df['Low'].iloc[-1]
-        c3 = df['Low'].iloc[-1] > df['High'].iloc[-3]
-        c4 = df['High'].iloc[-3] > df['Low'].iloc[-2]
-        c5 = df['Low'].iloc[-2] > df['High'].iloc[-4]
-        c6 = df['High'].iloc[-4] > df['Low'].iloc[-3]
-        c7 = df['Low'].iloc[-3] > df['Low'].iloc[-4]
-
-        if c1 and c2 and c3 and c4 and c5 and c6 and c7:
-            return 2  # Buy signal
-
-        # Sell conditions
-        c1 = df['Low'].iloc[-1] < df['Low'].iloc[-2]
-        c2 = df['Low'].iloc[-2] < df['High'].iloc[-1]
-        c3 = df['High'].iloc[-1] < df['Low'].iloc[-3]
-        c4 = df['Low'].iloc[-3] < df['High'].iloc[-2]
-        c5 = df['High'].iloc[-2] < df['Low'].iloc[-4]
-        c6 = df['Low'].iloc[-4] < df['High'].iloc[-3]
-        c7 = df['High'].iloc[-3] < df['High'].iloc[-4]
-
-        if c1 and c2 and c3 and c4 and c5 and c6 and c7:
-            return 1  # Sell signal
-
-        return 0  # No signal
+        # Use the exact same total_signal function from File 1
+        signal = total_signal(df, current_candle)
+        
+        # Log signal details for debugging
+        if signal == 2:
+            logger.info("BUY signal detected using File 1 logic")
+        elif signal == 1:
+            logger.info("SELL signal detected using File 1 logic")
+        else:
+            logger.debug("No signal detected")
+        
+        return signal
 
     def get_current_price(self):
         """Get current market price for the symbol"""
@@ -582,6 +601,7 @@ class BinanceFuturesBot:
     def run(self, interval_seconds=60):
         """Run the trading bot"""
         logger.info(f"Starting trading bot for {self.symbol} with {self.leverage}x leverage")
+        logger.info("Signal generation logic now matches File 1 exactly!")
         self.setup_futures_account()
         
         try:
@@ -606,3 +626,20 @@ class BinanceFuturesBot:
         finally:
             self.close_position()
 
+# Example usage
+if __name__ == "__main__":
+    # Replace with your actual API credentials
+    API_KEY = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ"
+    API_SECRET = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
+    
+    # Initialize the bot
+    bot = BinanceFuturesBot(
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        symbol='DOGEUSDT',
+        interval=Client.KLINE_INTERVAL_1HOUR,
+        leverage=10
+    )
+    
+    # Run the bot
+    bot.run(interval_seconds=60)
