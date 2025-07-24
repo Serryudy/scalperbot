@@ -17,8 +17,8 @@ CORS(app, origins=['https://traderdashbord.onrender.com', 'http://localhost:3000
 
 # --- IMPORTANT ---
 # Store your API keys securely. Using environment variables is a good practice.
-API_KEY = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ"
-API_SECRET = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
+API_KEY = "your api key"
+API_SECRET = "your api secret"
 
 client = Client(API_KEY, API_SECRET)
 

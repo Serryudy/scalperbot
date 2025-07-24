@@ -629,8 +629,8 @@ class BinanceFuturesBot:
 # Example usage
 if __name__ == "__main__":
     # Replace with your actual API credentials
-    API_KEY = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ"
-    API_SECRET = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
+    API_KEY = "your api key"
+    API_SECRET = "your api secret"
     
     # Initialize the bot
     bot = BinanceFuturesBot(
