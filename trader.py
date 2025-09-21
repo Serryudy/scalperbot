@@ -359,6 +359,13 @@ class BinanceFuturesBot:
             logger.info(f"Stop loss: {stop_loss}, Take profit: {take_profit}")
             logger.info(f"WARNING: Using full capital with {self.leverage}x leverage - HIGH RISK!")
             
+            # Cancel all existing orders before opening new position
+            try:
+                self.client.futures_cancel_all_open_orders(symbol=self.symbol)
+                logger.info("Canceled all existing orders before opening LONG position")
+            except BinanceAPIException as e:
+                logger.warning(f"Error canceling existing orders: {e}")
+            
             # Open position with market order
             order = self.client.futures_create_order(
                 symbol=self.symbol,
@@ -472,6 +479,13 @@ class BinanceFuturesBot:
             logger.info(f"Position size: {position_size} {self.symbol.replace('USDT', '')}")
             logger.info(f"Stop loss: {stop_loss}, Take profit: {take_profit}")
             logger.info(f"WARNING: Using full capital with {self.leverage}x leverage - HIGH RISK!")
+            
+            # Cancel all existing orders before opening new position
+            try:
+                self.client.futures_cancel_all_open_orders(symbol=self.symbol)
+                logger.info("Canceled all existing orders before opening SHORT position")
+            except BinanceAPIException as e:
+                logger.warning(f"Error canceling existing orders: {e}")
             
             # Open position with market order
             order = self.client.futures_create_order(
