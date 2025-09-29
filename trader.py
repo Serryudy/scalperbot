@@ -1,691 +1,307 @@
-import pandas as pd
-import numpy as np
+from telethon import TelegramClient, events
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
-from datetime import datetime
-import time
-import logging
-import sqlite3
-import json
+from binance.enums import *
+import re
+import asyncio
 
-# --- Database Setup ---
-def setup_database():
-    """Create database and tables if they don't exist"""
-    conn = sqlite3.connect('trades.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            symbol TEXT,
-            side TEXT,
-            quantity REAL,
-            entry_price REAL,
-            exit_price REAL,
-            profit REAL,
-            return_pct REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# ========== TELEGRAM ==========
+api_id = 23008284            # your Telegram API ID
+api_hash = "9b753f6de26369ddff1f498ce4d21fb5"  # your Telegram API Hash
+session_name = "my_session"
+group_id = -1002039861131  # replace with your group/channel ID
+topic_id = 40011           # your topic/thread ID
 
-def log_trade_to_db(symbol, side, quantity, entry_price, exit_price, profit):
-    """Logs a completed trade to the SQLite database."""
-    return_pct = ((exit_price - entry_price) / entry_price * 100) if side == 'LONG' else ((entry_price - exit_price) / entry_price * 100)
-    
-    conn = None
+# ========== BINANCE ==========
+binance_api_key = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ"
+binance_api_secret = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
+client = Client(binance_api_key, binance_api_secret, testnet=False)  # set testnet=False for live trading
+
+RISK_PER_TRADE = 0.05   # 5% risk
+LEVERAGE = 10
+RR_RATIO = 1.5          # risk:reward
+
+# ---------- Signal Extraction ----------
+def extract_signal(text, time):
+    signal = {
+        "time": str(time),
+        "symbol": None,
+        "side": None,
+        "entry": [],
+    }
+
+    # SIDE
+    if "LONG" in text.upper():
+        signal["side"] = "LONG"
+    elif "SHORT" in text.upper():
+        signal["side"] = "SHORT"
+
+    # SYMBOL
+    match_symbol = re.findall(r"\$([A-Z]{2,6})", text)
+    if match_symbol:
+        signal["symbol"] = match_symbol[0]
+
+    # ENTRIES
+    match_entries = re.findall(r"Entry(?:\s*limit)?[:\s]*([\d.]+)", text, re.IGNORECASE)
+    if match_entries:
+        signal["entry"] = [float(x) for x in match_entries]
+
+    return signal
+
+# ---------- Trading Functions ----------
+def get_account_balance():
+    info = client.futures_account()
+    balance = float(info["totalWalletBalance"])
+    return balance
+
+def round_step_size(value, step_size):
+    from decimal import Decimal, ROUND_DOWN
+    return float((Decimal(str(value)) // Decimal(str(step_size))) * Decimal(str(step_size)))
+
+def place_trade(signal):
     try:
-        conn = sqlite3.connect('trades.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO trades (symbol, side, quantity, entry_price, exit_price, profit, return_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (symbol, side, quantity, entry_price, exit_price, profit, return_pct))
-        conn.commit()
-        logging.info(f"Logged trade to database: {side} {quantity} {symbol} with profit ${profit:.2f} ({return_pct:+.2f}%)")
-    except sqlite3.Error as e:
-        logging.error(f"Database error while logging trade: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-# --- Signal Generation ---
-def total_signal(df, current_candle):
-    """Signal generation logic"""
-    current_pos = df.index.get_loc(current_candle)
-    if current_pos < 3:
-        return 0
-    
-    # Buy signal conditions
-    c1 = df['High'].iloc[current_pos] > df['High'].iloc[current_pos-1]
-    c2 = df['High'].iloc[current_pos-1] > df['Low'].iloc[current_pos]
-    c3 = df['Low'].iloc[current_pos] > df['High'].iloc[current_pos-2]
-    c4 = df['High'].iloc[current_pos-2] > df['Low'].iloc[current_pos-1]
-    c5 = df['Low'].iloc[current_pos-1] > df['High'].iloc[current_pos-3]
-    c6 = df['High'].iloc[current_pos-3] > df['Low'].iloc[current_pos-2]
-    c7 = df['Low'].iloc[current_pos-2] > df['Low'].iloc[current_pos-3]
-    
-    if c1 and c2 and c3 and c4 and c5 and c6 and c7:
-        return 2  # Buy
-    
-    # Sell signal conditions
-    c1 = df['Low'].iloc[current_pos] < df['Low'].iloc[current_pos-1]
-    c2 = df['Low'].iloc[current_pos-1] < df['High'].iloc[current_pos]
-    c3 = df['High'].iloc[current_pos] < df['Low'].iloc[current_pos-2]
-    c4 = df['Low'].iloc[current_pos-2] < df['High'].iloc[current_pos-1]
-    c5 = df['High'].iloc[current_pos-1] < df['Low'].iloc[current_pos-3]
-    c6 = df['Low'].iloc[current_pos-3] < df['High'].iloc[current_pos-2]
-    c7 = df['High'].iloc[current_pos-2] < df['High'].iloc[current_pos-3]
-    
-    if c1 and c2 and c3 and c4 and c5 and c6 and c7:
-        return 1  # Sell
-    
-    return 0
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("trading_bot.log"), logging.StreamHandler()]
-)
-logger = logging.getLogger()
-
-class OptimizedBinanceFuturesBot:
-    def __init__(self, api_key, api_secret, symbol, interval, 
-                 stop_loss_pct=2.0, take_profit_pct=3.0, 
-                 leverage=10, risk_per_trade=0.20,
-                 trading_session='all'):
-        """
-        Initialize trading bot with optimized parameters
+        symbol = f"{signal['symbol']}USDT"
+        side = signal['side'].upper()
+        entry_price = signal['entry'][0]
         
-        Args:
-            api_key: Binance API key
-            api_secret: Binance API secret
-            symbol: Trading pair (e.g., 'DOGEUSDT')
-            interval: Candle interval (e.g., Client.KLINE_INTERVAL_1HOUR)
-            stop_loss_pct: Stop loss percentage
-            take_profit_pct: Take profit percentage
-            leverage: Leverage multiplier
-            risk_per_trade: Risk per trade (0.20 = 20%)
-            trading_session: 'all', 'london', 'newyork', 'london_newyork', 'asian'
-        """
-        self.symbol = symbol
-        self.interval = interval
-        self.leverage = leverage
-        self.risk_per_trade = risk_per_trade
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
-        self.trading_session = trading_session
-        
-        self.client = Client(api_key, api_secret)
-        self.current_position = None
-        self.entry_price = 0
-        self.position_size = 0
-        
-        # Trading sessions (UTC time)
-        self.sessions = {
-            'all': {'start': 0, 'end': 24},
-            'london': {'start': 7, 'end': 16},
-            'newyork': {'start': 12, 'end': 21},
-            'london_newyork': {'start': 12, 'end': 16},
-            'asian': {'start': 23, 'end': 8}
-        }
-        
-        # Setup database
-        setup_database()
+        # Convert LONG/SHORT to BUY/SELL for Binance API
+        binance_side = "BUY" if side == "LONG" else "SELL"
 
-    def is_trading_session(self):
-        """Check if current time is within trading session"""
-        if self.trading_session == 'all':
-            return True
+        # --- Get symbol info from Binance ---
+        info = client.futures_exchange_info()
+        symbol_info = None
+        for s in info['symbols']:
+            if s['symbol'] == symbol:
+                symbol_info = s
+                price_filter = next(f for f in s['filters'] if f['filterType'] == 'PRICE_FILTER')
+                lot_size = next(f for f in s['filters'] if f['filterType'] == 'LOT_SIZE')
+                tick_size = float(price_filter['tickSize'])
+                step_size = float(lot_size['stepSize'])
+                break
         
-        current_hour = datetime.utcnow().hour
-        session = self.sessions[self.trading_session]
-        
-        if session['start'] < session['end']:
-            return session['start'] <= current_hour < session['end']
-        else:  # Session wraps around midnight
-            return current_hour >= session['start'] or current_hour < session['end']
-
-    def setup_futures_account(self):
-        """Set up the futures account with the specified leverage"""
-        try:
-            self.client.futures_change_margin_type(symbol=self.symbol, marginType='ISOLATED')
-        except BinanceAPIException as e:
-            if "Already" not in str(e):
-                logger.error(f"Error setting margin type: {e}")
-        
-        try:
-            self.client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage)
-            logger.info(f"Leverage set to {self.leverage}x for {self.symbol}")
-        except BinanceAPIException as e:
-            logger.error(f"Error setting leverage: {e}")
-
-    def get_current_position(self):
-        """Get the current position information"""
-        try:
-            positions = self.client.futures_position_information(symbol=self.symbol)
-            for position in positions:
-                if position['symbol'] == self.symbol:
-                    amt = float(position['positionAmt'])
-                    if amt > 0:
-                        self.current_position = 'LONG'
-                        self.entry_price = float(position['entryPrice'])
-                        self.position_size = amt
-                    elif amt < 0:
-                        self.current_position = 'SHORT'
-                        self.entry_price = float(position['entryPrice'])
-                        self.position_size = abs(amt)
-                    else:
-                        self.current_position = None
-                        self.entry_price = 0
-                        self.position_size = 0
-                    return self.current_position, amt
-        except BinanceAPIException as e:
-            logger.error(f"Error getting position: {e}")
-        return None, 0
-
-    def fetch_account_balance(self):
-        """Fetch USDT balance in futures account"""
-        try:
-            account_info = self.client.futures_account_balance()
-            for asset in account_info:
-                if asset['asset'] == 'USDT':
-                    return float(asset['balance'])
-        except BinanceAPIException as e:
-            logger.error(f"Error fetching balance: {e}")
-        return 0.0
-
-    def get_symbol_info(self):
-        """Get symbol information including precision"""
-        try:
-            exchange_info = self.client.futures_exchange_info()
-            for symbol_info in exchange_info['symbols']:
-                if symbol_info['symbol'] == self.symbol:
-                    return symbol_info
-        except BinanceAPIException as e:
-            logger.error(f"Error getting symbol info: {e}")
-        return None
-
-    def get_price_precision(self, symbol_info=None):
-        """Get price precision for the symbol"""
         if not symbol_info:
-            symbol_info = self.get_symbol_info()
-        
-        price_precision = 2
-        if symbol_info:
-            for filter in symbol_info['filters']:
-                if filter['filterType'] == 'PRICE_FILTER':
-                    tick_size = filter['tickSize']
-                    if '.' in tick_size:
-                        price_precision = len(tick_size.rstrip('0').split('.')[1])
-                    break
-        return price_precision
+            print(f"Error: Symbol {symbol} not found on Binance Futures")
+            return
 
-    def get_quantity_precision(self, symbol_info=None):
-        """Get quantity precision for the symbol"""
-        if not symbol_info:
-            symbol_info = self.get_symbol_info()
-        
-        qty_precision = 0
-        if symbol_info:
-            for filter in symbol_info['filters']:
-                if filter['filterType'] == 'LOT_SIZE':
-                    step_size = filter['stepSize']
-                    if '.' in step_size:
-                        qty_precision = len(step_size.rstrip('0').split('.')[1])
-                    break
-        return qty_precision
-
-    def round_price(self, price):
-        """Round price to appropriate precision"""
-        precision = self.get_price_precision()
-        return round(price, precision)
-
-    def round_quantity(self, quantity):
-        """Round quantity to appropriate precision"""
-        precision = self.get_quantity_precision()
-        return round(quantity, precision)
-
-    def calculate_position_size_with_risk(self, entry_price):
-        """
-        Calculate position size based on 20% risk per trade
-        This ensures we only risk 20% of capital on each trade
-        """
-        balance = self.fetch_account_balance()
-        
-        # Amount we're willing to risk (20% of capital)
-        risk_amount = balance * self.risk_per_trade
-        
-        # Distance to stop loss in price
-        stop_distance = entry_price * (self.stop_loss_pct / 100)
-        
-        # Position size needed to risk exactly risk_amount
-        # If we lose stop_distance per coin, we want total loss = risk_amount
-        position_size_coins = risk_amount / stop_distance
-        
-        # With leverage, we can control a larger position
-        # But our RISK is still capped at risk_amount
-        leveraged_position = position_size_coins * self.leverage
-        
-        # Ensure we don't exceed capital limits
-        max_position_by_capital = (balance * self.leverage) / entry_price
-        
-        # Use the smaller value
-        final_position = min(leveraged_position, max_position_by_capital)
-        
-        # Round to correct precision
-        final_position = self.round_quantity(final_position)
-        
-        # Ensure minimum position size
-        symbol_info = self.get_symbol_info()
-        if symbol_info:
-            for filter in symbol_info['filters']:
-                if filter['filterType'] == 'LOT_SIZE':
-                    min_qty = float(filter['minQty'])
-                    if final_position < min_qty:
-                        final_position = min_qty
-                        logger.warning(f"Position size adjusted to minimum: {min_qty}")
-                    break
-        
-        logger.info(f"Account Balance: ${balance:.2f}")
-        logger.info(f"Risk Amount (20%): ${risk_amount:.2f}")
-        logger.info(f"Entry Price: ${entry_price:.4f}")
-        logger.info(f"Stop Loss Distance: ${stop_distance:.4f}")
-        logger.info(f"Position Size: {final_position} coins")
-        logger.info(f"Position Value: ${final_position * entry_price:.2f}")
-        logger.info(f"Max Loss if SL Hit: ${risk_amount:.2f}")
-        
-        return final_position
-
-    def fetch_latest_candles(self, num_candles=4):
-        """Fetch the latest candles needed for signal generation"""
+        # --- Set Leverage ---
         try:
-            klines = self.client.futures_klines(
-                symbol=self.symbol,
-                interval=self.interval,
-                limit=num_candles
-            )
-            
-            df = pd.DataFrame(klines, columns=[
-                'OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume',
-                'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades',
-                'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'
-            ])
-            
-            df['OpenTime'] = pd.to_datetime(df['OpenTime'], unit='ms')
-            
-            for col in ['Open', 'High', 'Low', 'Close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            df.set_index('OpenTime', inplace=True)
-            
-            return df
-        except BinanceAPIException as e:
-            logger.error(f"Error fetching candles: {e}")
-            return None
+            client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+            print(f"Leverage set to {LEVERAGE}x for {symbol}")
+        except Exception as e:
+            print(f"Warning: Could not set leverage - {e}")
 
-    def get_signal(self):
-        """Get the current trading signal"""
-        # Check if we're in trading session
-        if not self.is_trading_session():
-            logger.debug(f"Outside trading session: {self.trading_session}")
-            return 0
+        # --- Risk Management ---
+        account = client.futures_account_balance()
+        usdt_balance = float(next(b for b in account if b['asset'] == 'USDT')['balance'])
         
-        df = self.fetch_latest_candles(num_candles=4)
-        if df is None or len(df) < 4:
-            logger.error("Not enough candles to generate signal")
-            return 0
+        # Get account info to check available margin
+        account_info = client.futures_account()
+        available_balance = float(account_info['availableBalance'])
         
-        current_candle = df.index[-1]
-        signal = total_signal(df, current_candle)
-        
-        if signal == 2:
-            logger.info("BUY signal detected")
-        elif signal == 1:
-            logger.info("SELL signal detected")
-        
-        return signal
-
-    def get_current_price(self):
-        """Get current market price for the symbol"""
-        try:
-            ticker = self.client.futures_symbol_ticker(symbol=self.symbol)
-            return float(ticker['price'])
-        except BinanceAPIException as e:
-            logger.error(f"Error getting current price: {e}")
-            return None
-
-    def execute_trade(self, signal):
-        """Execute a trade based on the signal"""
-        current_position, position_amt = self.get_current_position()
-        
-        current_price = self.get_current_price()
-        if current_price is None:
-            logger.error("Failed to get current price. Aborting trade execution.")
+        if available_balance <= 0:
+            print("Error: Insufficient available balance")
             return
         
-        if signal == 2:  # Buy signal
-            if current_position == 'SHORT':
-                logger.info("Closing SHORT position before opening LONG")
-                self.close_position()
-                time.sleep(2)
-            
-            if current_position != 'LONG':
-                self.open_long_position(current_price)
+        risk_per_trade = usdt_balance * RISK_PER_TRADE  # 5% risk
+        stop_loss_pct = 0.02  # 2% stop loss
         
-        elif signal == 1:  # Sell signal
-            if current_position == 'LONG':
-                logger.info("Closing LONG position before opening SHORT")
-                self.close_position()
-                time.sleep(2)
+        # Calculate position size based on risk and leverage
+        # Position value = (risk amount / stop loss %)
+        position_value = (risk_per_trade / stop_loss_pct)
+        qty = position_value / entry_price
             
-            if current_position != 'SHORT':
-                self.open_short_position(current_price)
-
-    def check_price_filter(self, price):
-        """Check if price meets the PRICE_FILTER requirements"""
-        symbol_info = self.get_symbol_info()
-        if symbol_info:
-            for filter in symbol_info['filters']:
-                if filter['filterType'] == 'PRICE_FILTER':
-                    min_price = float(filter['minPrice'])
-                    max_price = float(filter['maxPrice'])
-                    
-                    if price < min_price:
-                        logger.warning(f"Price {price} below minimum {min_price}. Adjusting.")
-                        return min_price
-                    
-                    if price > max_price:
-                        logger.warning(f"Price {price} above maximum {max_price}. Adjusting.")
-                        return max_price
+        # --- Get current market price ---
+        try:
+            ticker = client.futures_symbol_ticker(symbol=symbol)
+            current_price = float(ticker['price'])
+            print(f"Current market price: {current_price}")
+        except Exception as e:
+            print(f"❌ Could not fetch current price: {e}")
+            return
         
-        return price
+        # --- Determine order type based on market conditions ---
+        use_market_order = False
+        
+        if side == "LONG":
+            # For LONG: if current price <= entry, market has moved in our favor
+            if current_price <= entry_price:
+                use_market_order = True
+                print(f"✓ Market price ({current_price}) is below entry ({entry_price})")
+                print(f"  Placing MARKET order to enter immediately")
+            else:
+                print(f"ℹ Market price ({current_price}) is above entry ({entry_price})")
+                print(f"  Placing LIMIT order and waiting for price to come down")
+        else:  # SHORT
+            # For SHORT: if current price >= entry, market has moved in our favor
+            if current_price >= entry_price:
+                use_market_order = True
+                print(f"✓ Market price ({current_price}) is above entry ({entry_price})")
+                print(f"  Placing MARKET order to enter immediately")
+            else:
+                print(f"ℹ Market price ({current_price}) is below entry ({entry_price})")
+                print(f"  Placing LIMIT order and waiting for price to come up")
+        
+        # Recalculate stop loss and take profit based on actual entry price
+        actual_entry = current_price if use_market_order else entry_price
+        stop_loss = actual_entry * (1 - stop_loss_pct) if side == "LONG" else actual_entry * (1 + stop_loss_pct)
+        take_profit = actual_entry + (actual_entry - stop_loss) * RR_RATIO if side == "LONG" else actual_entry - (stop_loss - actual_entry) * RR_RATIO
 
-    def open_long_position(self, current_price):
-        """Open a long position with 20% risk management"""
+        # --- Round values according to Binance rules ---
+        stop_loss = round_step_size(stop_loss, tick_size)
+        take_profit = round_step_size(take_profit, tick_size)
+        qty = round_step_size(qty, step_size)
+        
+        if not use_market_order:
+            entry_price = round_step_size(entry_price, tick_size)
+        
+        # Calculate required margin
+        position_value = qty * entry_price
+        required_margin = position_value / LEVERAGE
+        
+        # Check if we have enough available margin
+        if required_margin > available_balance * 0.95:  # Leave 5% buffer
+            print(f"❌ Insufficient available margin.")
+            print(f"   Required: {required_margin:.2f} USDT")
+            print(f"   Available: {available_balance:.2f} USDT")
+            print(f"   Total Balance: {usdt_balance:.2f} USDT")
+            print(f"   (Margin already used in other positions)")
+            return
+
+        print(f"\n{'='*50}")
+        print(f"Placing {side} {'MARKET' if use_market_order else 'LIMIT'} order on {symbol}")
+        if use_market_order:
+            print(f"Entry: MARKET (~{current_price}), Stop: {stop_loss}, TP: {take_profit}, Qty: {qty}")
+        else:
+            print(f"Entry: {entry_price}, Stop: {stop_loss}, TP: {take_profit}, Qty: {qty}")
+        print(f"Total Balance: {usdt_balance:.2f} USDT")
+        print(f"Available Balance: {available_balance:.2f} USDT")
+        print(f"Position Value: {position_value:.2f} USDT")
+        print(f"Required Margin: {required_margin:.2f} USDT")
+        print(f"Risk Amount: {risk_per_trade:.2f} USDT ({RISK_PER_TRADE*100}%)")
+        print(f"{'='*50}\n")
+
+        # --- Place order (MARKET or LIMIT) ---
         try:
-            latest_price = self.get_current_price()
-            if latest_price is None:
-                logger.error("Failed to get latest price. Aborting long position.")
-                return
-            
-            # Calculate position size with risk management
-            position_size = self.calculate_position_size_with_risk(latest_price)
-            
-            if position_size <= 0:
-                logger.error("Invalid position size calculated. Aborting.")
-                return
-            
-            # Calculate SL/TP
-            stop_loss = latest_price * (1 - self.stop_loss_pct/100)
-            take_profit = latest_price * (1 + self.take_profit_pct/100)
-            
-            stop_loss = self.round_price(stop_loss)
-            take_profit = self.round_price(take_profit)
-            
-            stop_loss = self.check_price_filter(stop_loss)
-            take_profit = self.check_price_filter(take_profit)
-            
-            logger.info(f"Opening LONG position at {latest_price}")
-            logger.info(f"Stop Loss: {stop_loss} (-{self.stop_loss_pct}%)")
-            logger.info(f"Take Profit: {take_profit} (+{self.take_profit_pct}%)")
-            logger.info(f"Risk/Reward Ratio: 1:{self.take_profit_pct/self.stop_loss_pct:.2f}")
-            
-            # Cancel all existing orders
-            try:
-                self.client.futures_cancel_all_open_orders(symbol=self.symbol)
-            except BinanceAPIException as e:
-                logger.warning(f"Error canceling existing orders: {e}")
-            
-            # Open position
-            order = self.client.futures_create_order(
-                symbol=self.symbol,
-                side='BUY',
-                type='MARKET',
-                quantity=position_size
-            )
-            
-            time.sleep(2)
-            
-            # Verify position
-            current_position, position_amt = self.get_current_position()
-            if current_position != 'LONG' or position_amt <= 0:
-                logger.warning("Long position order may not have executed properly.")
-                return
-            
-            # Set stop loss
-            try:
-                sl_order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side='SELL',
-                    type='STOP_MARKET',
-                    stopPrice=stop_loss,
-                    closePosition='true'
+            if use_market_order:
+                order = client.futures_create_order(
+                    symbol=symbol,
+                    side=binance_side,
+                    type="MARKET",
+                    quantity=qty
                 )
-                logger.info(f"Stop loss set: {sl_order['orderId']}")
-            except BinanceAPIException as e:
-                logger.error(f"Error setting stop loss: {e}")
-            
-            # Set take profit
-            try:
-                tp_order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side='SELL',
-                    type='TAKE_PROFIT_MARKET',
-                    stopPrice=take_profit,
-                    closePosition='true'
+                print(f"✓ MARKET order executed: {order['orderId']}")
+            else:
+                order = client.futures_create_order(
+                    symbol=symbol,
+                    side=binance_side,
+                    type="LIMIT",
+                    timeInForce="GTC",
+                    quantity=qty,
+                    price=entry_price
                 )
-                logger.info(f"Take profit set: {tp_order['orderId']}")
-            except BinanceAPIException as e:
-                logger.error(f"Error setting take profit: {e}")
-            
-            logger.info(f"✅ LONG position opened: {order['orderId']}")
-            self.current_position = 'LONG'
-            
-        except BinanceAPIException as e:
-            logger.error(f"Error opening long position: {e}")
+                print(f"✓ LIMIT order placed: {order['orderId']}")
         except Exception as e:
-            logger.error(f"Unexpected error opening long position: {e}")
-
-    def open_short_position(self, current_price):
-        """Open a short position with 20% risk management"""
+            print(f"❌ Failed to place entry order: {e}")
+            return
+        
+        sl_order_id = None
+        tp_order_id = None
+        
+        # --- Place Stop Loss ---
         try:
-            latest_price = self.get_current_price()
-            if latest_price is None:
-                logger.error("Failed to get latest price. Aborting short position.")
-                return
-            
-            # Calculate position size with risk management
-            position_size = self.calculate_position_size_with_risk(latest_price)
-            
-            if position_size <= 0:
-                logger.error("Invalid position size calculated. Aborting.")
-                return
-            
-            # Calculate SL/TP
-            stop_loss = latest_price * (1 + self.stop_loss_pct/100)
-            take_profit = latest_price * (1 - self.take_profit_pct/100)
-            
-            stop_loss = self.round_price(stop_loss)
-            take_profit = self.round_price(take_profit)
-            
-            stop_loss = self.check_price_filter(stop_loss)
-            take_profit = self.check_price_filter(take_profit)
-            
-            logger.info(f"Opening SHORT position at {latest_price}")
-            logger.info(f"Stop Loss: {stop_loss} (+{self.stop_loss_pct}%)")
-            logger.info(f"Take Profit: {take_profit} (-{self.take_profit_pct}%)")
-            logger.info(f"Risk/Reward Ratio: 1:{self.take_profit_pct/self.stop_loss_pct:.2f}")
-            
-            # Cancel all existing orders
-            try:
-                self.client.futures_cancel_all_open_orders(symbol=self.symbol)
-            except BinanceAPIException as e:
-                logger.warning(f"Error canceling existing orders: {e}")
-            
-            # Open position
-            order = self.client.futures_create_order(
-                symbol=self.symbol,
-                side='SELL',
-                type='MARKET',
-                quantity=position_size
+            sl_side = "SELL" if side == "LONG" else "BUY"
+            sl_order = client.futures_create_order(
+                symbol=symbol,
+                side=sl_side,
+                type="STOP_MARKET",
+                stopPrice=stop_loss,
+                quantity=qty,
+                closePosition=False
             )
-            
-            time.sleep(2)
-            
-            # Verify position
-            current_position, position_amt = self.get_current_position()
-            if current_position != 'SHORT' or position_amt >= 0:
-                logger.warning("Short position order may not have executed properly.")
-                return
-            
-            # Set stop loss
-            try:
-                sl_order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side='BUY',
-                    type='STOP_MARKET',
-                    stopPrice=stop_loss,
-                    closePosition='true'
-                )
-                logger.info(f"Stop loss set: {sl_order['orderId']}")
-            except BinanceAPIException as e:
-                logger.error(f"Error setting stop loss: {e}")
-            
-            # Set take profit
-            try:
-                tp_order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side='BUY',
-                    type='TAKE_PROFIT_MARKET',
-                    stopPrice=take_profit,
-                    closePosition='true'
-                )
-                logger.info(f"Take profit set: {tp_order['orderId']}")
-            except BinanceAPIException as e:
-                logger.error(f"Error setting take profit: {e}")
-            
-            logger.info(f"✅ SHORT position opened: {order['orderId']}")
-            self.current_position = 'SHORT'
-            
-        except BinanceAPIException as e:
-            logger.error(f"Error opening short position: {e}")
+            sl_order_id = sl_order['orderId']
+            print(f"✓ Stop Loss set at {stop_loss} (Order ID: {sl_order_id})")
         except Exception as e:
-            logger.error(f"Unexpected error opening short position: {e}")
-
-    def close_position(self):
-        """Close the current position and log the trade"""
-        try:
-            current_position, position_amt = self.get_current_position()
-            if current_position is None or position_amt == 0:
-                logger.info("No position to close")
+            error_msg = str(e)
+            print(f"⚠ Warning: Could not set stop loss - {e}")
+            
+            # Check if it's the "would immediately trigger" error
+            if "-2021" in error_msg or "immediately trigger" in error_msg:
+                print(f"⚠ Stop loss price ({stop_loss}) would trigger immediately!")
+                print(f"   Current market has likely moved past your stop loss.")
+                print(f"   Consider adjusting your stop loss distance or skip this trade.")
+            
+            # Cancel entry order if SL fails
+            print(f"⚠ Attempting to cancel entry order {order['orderId']}...")
+            try:
+                cancel_response = client.futures_cancel_order(
+                    symbol=symbol, 
+                    orderId=order['orderId']
+                )
+                print(f"✓ Entry order canceled successfully")
                 return
-
-            self.client.futures_cancel_all_open_orders(symbol=self.symbol)
-            
-            side = 'SELL' if current_position == 'LONG' else 'BUY'
-            quantity = abs(position_amt)
-            
-            exit_price = self.get_current_price()
-
-            order = self.client.futures_create_order(
-                symbol=self.symbol,
-                side=side,
-                type='MARKET',
-                quantity=self.round_quantity(quantity)
-            )
-
-            # Calculate profit
-            profit = 0
-            if self.entry_price > 0 and exit_price > 0:
-                if current_position == 'LONG':
-                    profit = (exit_price - self.entry_price) * quantity
+            except Exception as cancel_error:
+                cancel_error_msg = str(cancel_error)
+                # Check if order already filled
+                if "-2011" in cancel_error_msg or "Unknown order" in cancel_error_msg:
+                    print(f"⚠ Entry order already filled or doesn't exist!")
+                    print(f"⚠ WARNING: You may have an open position WITHOUT stop loss!")
+                    print(f"⚠ Please manually set stop loss at {stop_loss} or close position!")
                 else:
-                    profit = (self.entry_price - exit_price) * quantity
-            
-            # Log to database
-            log_trade_to_db(self.symbol, current_position, quantity, 
-                          self.entry_price, exit_price, profit)
-
-            logger.info(f"✅ Closed {current_position} position: {order['orderId']}")
-            logger.info(f"PnL: ${profit:+.2f}")
-            
-            self.current_position = None
-            self.entry_price = 0
-            self.position_size = 0
-
-        except BinanceAPIException as e:
-            logger.error(f"Error closing position: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error closing position: {e}")
-
-    def run(self, check_interval_seconds=60):
-        """Run the trading bot"""
-        logger.info(f"{'='*60}")
-        logger.info(f"Starting Optimized Trading Bot")
-        logger.info(f"{'='*60}")
-        logger.info(f"Symbol: {self.symbol}")
-        logger.info(f"Interval: {self.interval}")
-        logger.info(f"Leverage: {self.leverage}x")
-        logger.info(f"Risk Per Trade: {self.risk_per_trade*100}%")
-        logger.info(f"Stop Loss: {self.stop_loss_pct}%")
-        logger.info(f"Take Profit: {self.take_profit_pct}%")
-        logger.info(f"Risk/Reward: 1:{self.take_profit_pct/self.stop_loss_pct:.2f}")
-        logger.info(f"Trading Session: {self.trading_session}")
-        logger.info(f"{'='*60}\n")
+                    print(f"❌ Failed to cancel entry order: {cancel_error}")
+                    print(f"⚠ URGENT: Manually cancel order {order['orderId']} on Binance!")
+                return
         
-        self.setup_futures_account()
-        
+        # --- Place Take Profit ---
         try:
-            while True:
-                try:
-                    signal = self.get_signal()
-                    if signal > 0:
-                        logger.info(f"🔔 Signal detected: {'BUY' if signal == 2 else 'SELL'}")
-                        self.execute_trade(signal)
-                    else:
-                        logger.debug("No trading signal")
-                    
-                    time.sleep(check_interval_seconds)
-                    
-                except BinanceAPIException as e:
-                    logger.error(f"Binance API error: {e}")
-                    time.sleep(30)
-                except Exception as e:
-                    logger.error(f"Error in bot loop: {e}")
-                    time.sleep(30)
-                    
-        except KeyboardInterrupt:
-            logger.info("\n⚠️  Bot stopped by user")
-        finally:
-            logger.info("Closing any open positions...")
-            self.close_position()
-            logger.info("Bot shutdown complete")
+            tp_side = "SELL" if side == "LONG" else "BUY"
+            tp_order = client.futures_create_order(
+                symbol=symbol,
+                side=tp_side,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=take_profit,
+                quantity=qty,
+                closePosition=False
+            )
+            tp_order_id = tp_order['orderId']
+            print(f"✓ Take Profit set at {take_profit} (Order ID: {tp_order_id})")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"⚠ Warning: Could not set take profit - {e}")
+            
+            if "-2021" in error_msg or "immediately trigger" in error_msg:
+                print(f"⚠ Take profit price ({take_profit}) would trigger immediately!")
+            
+            print(f"ℹ Stop Loss is still active at {stop_loss}")
+            
+    except Exception as e:
+        print(f"❌ Error placing trade: {e}")
+        import traceback
+        traceback.print_exc()
 
 
+# ---------- Telegram Integration ----------
+async def main():
+    tg = TelegramClient(session_name, api_id, api_hash)
+    await tg.start()
+    entity = await tg.get_entity(group_id)
 
+    print("Fetching past signals...\n")
+    async for msg in tg.iter_messages(entity, reply_to=topic_id, limit=10):
+        if msg.text:
+            parsed = extract_signal(msg.text, msg.date)
+            if parsed["symbol"] and parsed["side"] and parsed["entry"]:
+                print("Signal found:", parsed)
+                place_trade(parsed)
 
+    # Listen for new signals
+    @tg.on(events.NewMessage(chats=entity))
+    async def handler(event):
+        if event.message.reply_to and event.message.reply_to.reply_to_msg_id == topic_id:
+            parsed = extract_signal(event.message.text or "", event.message.date)
+            if parsed["symbol"] and parsed["side"] and parsed["entry"]:
+                print("NEW SIGNAL:", parsed)
+                place_trade(parsed)
 
-def run_default():
-    """Run bot with conservative default settings"""
-    API_KEY = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ"
-    API_SECRET = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
-    
-    bot = OptimizedBinanceFuturesBot(
-        api_key=API_KEY,
-        api_secret=API_SECRET,
-        symbol='DOGEUSDT',
-        interval=Client.KLINE_INTERVAL_15MINUTE,
-        stop_loss_pct=1.0,
-        take_profit_pct=1.5,
-        leverage=10,
-        risk_per_trade=0.10,
-        trading_session='all'
-    )
-    
-    bot.run(check_interval_seconds=60)
+    print("Listening for new messages...\n")
+    await tg.run_until_disconnected()
 
-
-if __name__ == "__main__":
-    run_default()
+asyncio.run(main())
