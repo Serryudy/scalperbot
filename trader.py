@@ -18,7 +18,7 @@ client = Client(binance_api_key, binance_api_secret, testnet=False)  # set testn
 
 RISK_PER_TRADE = 0.05   # 5% risk
 LEVERAGE = 10
-RR_RATIO = 1.5          # risk:reward
+RR_RATIO = 1.0          # risk:reward
 
 # ---------- Signal Extraction ----------
 def extract_signal(text, time):
@@ -102,7 +102,7 @@ def place_trade(signal):
             return
         
         risk_per_trade = usdt_balance * RISK_PER_TRADE  # 5% risk
-        stop_loss_pct = 0.02  # 2% stop loss
+        stop_loss_pct = 0.01  # 1% stop loss
         
         # Calculate position size based on risk and leverage
         # Position value = (risk amount / stop loss %)
