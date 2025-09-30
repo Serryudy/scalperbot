@@ -5,20 +5,23 @@ import re
 import asyncio
 
 # ========== TELEGRAM ==========
-api_id = 23008284            # your Telegram API ID
-api_hash = "9b753f6de26369ddff1f498ce4d21fb5"  # your Telegram API Hash
+api_id = 23008284
+api_hash = "9b753f6de26369ddff1f498ce4d21fb5"
 session_name = "my_session"
-group_id = -1002039861131  # replace with your group/channel ID
-topic_id = 40011           # your topic/thread ID
+group_id = -1002039861131
+topic_id = 40011
 
 # ========== BINANCE ==========
 binance_api_key = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ"
 binance_api_secret = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
-client = Client(binance_api_key, binance_api_secret, testnet=False)  # set testnet=False for live trading
+client = Client(binance_api_key, binance_api_secret, testnet=False)
 
-RISK_PER_TRADE = 0.05   # 5% risk
+RISK_PER_TRADE = 0.05
 LEVERAGE = 10
-RR_RATIO = 1.0          # risk:reward
+RR_RATIO = 1.0
+
+# Track open positions with their order IDs
+open_positions = {}  # {symbol: {'side': 'LONG', 'sl_order_id': 123, 'tp_order_id': 456, 'qty': 0.5}}
 
 # ---------- Signal Extraction ----------
 def extract_signal(text, time):
@@ -27,7 +30,17 @@ def extract_signal(text, time):
         "symbol": None,
         "side": None,
         "entry": [],
+        "is_close": False
     }
+
+    # Check if this is a close signal
+    if re.search(r'\bclose\b', text, re.IGNORECASE):
+        signal["is_close"] = True
+        # Extract symbol from close signal (e.g., "XLM + 21.4% profit" or "Close XLM")
+        match_symbol = re.findall(r'\b([A-Z]{2,6})\b', text)
+        if match_symbol:
+            signal["symbol"] = match_symbol[0]
+        return signal
 
     # SIDE
     if "LONG" in text.upper():
@@ -40,12 +53,138 @@ def extract_signal(text, time):
     if match_symbol:
         signal["symbol"] = match_symbol[0]
 
-    # ENTRIES
-    match_entries = re.findall(r"Entry(?:\s*limit)?[:\s]*([\d.]+)", text, re.IGNORECASE)
+    # ENTRIES - improved pattern and validation
+    match_entries = re.findall(r"Entry(?:\s*limit)?[:\s]+([\d]+\.?[\d]*)", text, re.IGNORECASE)
     if match_entries:
-        signal["entry"] = [float(x) for x in match_entries]
+        for x in match_entries:
+            try:
+                price = float(x)
+                if price > 0:
+                    signal["entry"].append(price)
+            except (ValueError, TypeError):
+                pass
 
     return signal
+
+# ---------- Close Position Function ----------
+def close_position(signal):
+    """Close an open position based on close signal"""
+    symbol_base = signal['symbol']
+    symbol = f"{symbol_base}USDT"
+    
+    if symbol_base not in open_positions:
+        print(f"⚠ No tracked position found for {symbol_base}")
+        print(f"  Checking Binance for any open positions...")
+        
+        # Check if there's actually an open position on Binance
+        try:
+            positions = client.futures_position_information(symbol=symbol)
+            for pos in positions:
+                if float(pos['positionAmt']) != 0:
+                    print(f"  Found open position on Binance!")
+                    # We'll close it anyway even if not tracked
+                    break
+            else:
+                print(f"  No open position found on Binance either.")
+                return
+        except Exception as e:
+            print(f"❌ Error checking position: {e}")
+            return
+    
+    try:
+        print(f"\n{'='*50}")
+        print(f"🔒 CLOSE SIGNAL DETECTED for {symbol_base}")
+        print(f"{'='*50}")
+        
+        # Get current position info from Binance
+        positions = client.futures_position_information(symbol=symbol)
+        position = None
+        for pos in positions:
+            if float(pos['positionAmt']) != 0:
+                position = pos
+                break
+        
+        if not position:
+            print(f"⚠ No open position found on Binance for {symbol}")
+            # Clean up tracking
+            if symbol_base in open_positions:
+                del open_positions[symbol_base]
+            return
+        
+        position_amt = float(position['positionAmt'])
+        entry_price = float(position['entryPrice'])
+        
+        # Get current market price
+        ticker = client.futures_symbol_ticker(symbol=symbol)
+        current_price = float(ticker['price'])
+        
+        # Calculate P&L
+        if position_amt > 0:  # LONG position
+            pnl = (current_price - entry_price) * abs(position_amt)
+            side_text = "LONG"
+        else:  # SHORT position
+            pnl = (entry_price - current_price) * abs(position_amt)
+            side_text = "SHORT"
+        
+        print(f"Position: {side_text}")
+        print(f"Entry Price: {entry_price}")
+        print(f"Current Price: {current_price}")
+        print(f"Quantity: {abs(position_amt)}")
+        print(f"Estimated P&L: {pnl:+.2f} USDT")
+        
+        # Cancel all open orders for this symbol (SL and TP)
+        if symbol_base in open_positions:
+            pos_data = open_positions[symbol_base]
+            
+            # Cancel Stop Loss
+            if pos_data.get('sl_order_id'):
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=pos_data['sl_order_id'])
+                    print(f"✓ Cancelled Stop Loss order {pos_data['sl_order_id']}")
+                except Exception as e:
+                    if "-2011" not in str(e):  # Ignore "Unknown order" error
+                        print(f"⚠ Could not cancel SL: {e}")
+            
+            # Cancel Take Profit
+            if pos_data.get('tp_order_id'):
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=pos_data['tp_order_id'])
+                    print(f"✓ Cancelled Take Profit order {pos_data['tp_order_id']}")
+                except Exception as e:
+                    if "-2011" not in str(e):
+                        print(f"⚠ Could not cancel TP: {e}")
+        else:
+            # Try to cancel all open orders for this symbol
+            try:
+                client.futures_cancel_all_open_orders(symbol=symbol)
+                print(f"✓ Cancelled all open orders for {symbol}")
+            except Exception as e:
+                print(f"⚠ Could not cancel orders: {e}")
+        
+        # Close position at market price
+        close_side = "SELL" if position_amt > 0 else "BUY"
+        
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="MARKET",
+            quantity=abs(position_amt),
+            reduceOnly=True
+        )
+        
+        print(f"✓ Position closed at market price")
+        print(f"  Order ID: {order['orderId']}")
+        print(f"{'='*50}\n")
+        
+        # Remove from tracking
+        if symbol_base in open_positions:
+            del open_positions[symbol_base]
+            print(f"✓ Removed {symbol_base} from position tracking")
+        
+    except Exception as e:
+        print(f"❌ Error closing position for {symbol_base}: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ---------- Trading Functions ----------
 def get_account_balance():
@@ -59,9 +198,16 @@ def round_step_size(value, step_size):
 
 def place_trade(signal):
     try:
-        symbol = f"{signal['symbol']}USDT"
+        symbol_base = signal['symbol']
+        symbol = f"{symbol_base}USDT"
         side = signal['side'].upper()
         entry_price = signal['entry'][0]
+        
+        # Check if we already have a position for this symbol
+        if symbol_base in open_positions:
+            print(f"⚠ Already have an open position for {symbol_base}")
+            print(f"  Skipping new {side} signal")
+            return
         
         # Convert LONG/SHORT to BUY/SELL for Binance API
         binance_side = "BUY" if side == "LONG" else "SELL"
@@ -93,7 +239,6 @@ def place_trade(signal):
         account = client.futures_account_balance()
         usdt_balance = float(next(b for b in account if b['asset'] == 'USDT')['balance'])
         
-        # Get account info to check available margin
         account_info = client.futures_account()
         available_balance = float(account_info['availableBalance'])
         
@@ -101,11 +246,9 @@ def place_trade(signal):
             print("Error: Insufficient available balance")
             return
         
-        risk_per_trade = usdt_balance * RISK_PER_TRADE  # 5% risk
-        stop_loss_pct = 0.01  # 1% stop loss
+        risk_per_trade = usdt_balance * RISK_PER_TRADE
+        stop_loss_pct = 0.01
         
-        # Calculate position size based on risk and leverage
-        # Position value = (risk amount / stop loss %)
         position_value = (risk_per_trade / stop_loss_pct)
         qty = position_value / entry_price
             
@@ -122,7 +265,6 @@ def place_trade(signal):
         use_market_order = False
         
         if side == "LONG":
-            # For LONG: if current price <= entry, market has moved in our favor
             if current_price <= entry_price:
                 use_market_order = True
                 print(f"✓ Market price ({current_price}) is below entry ({entry_price})")
@@ -131,7 +273,6 @@ def place_trade(signal):
                 print(f"ℹ Market price ({current_price}) is above entry ({entry_price})")
                 print(f"  Placing LIMIT order and waiting for price to come down")
         else:  # SHORT
-            # For SHORT: if current price >= entry, market has moved in our favor
             if current_price >= entry_price:
                 use_market_order = True
                 print(f"✓ Market price ({current_price}) is above entry ({entry_price})")
@@ -140,7 +281,6 @@ def place_trade(signal):
                 print(f"ℹ Market price ({current_price}) is below entry ({entry_price})")
                 print(f"  Placing LIMIT order and waiting for price to come up")
         
-        # Recalculate stop loss and take profit based on actual entry price
         actual_entry = current_price if use_market_order else entry_price
         stop_loss = actual_entry * (1 - stop_loss_pct) if side == "LONG" else actual_entry * (1 + stop_loss_pct)
         take_profit = actual_entry + (actual_entry - stop_loss) * RR_RATIO if side == "LONG" else actual_entry - (stop_loss - actual_entry) * RR_RATIO
@@ -153,12 +293,10 @@ def place_trade(signal):
         if not use_market_order:
             entry_price = round_step_size(entry_price, tick_size)
         
-        # Calculate required margin
         position_value = qty * entry_price
         required_margin = position_value / LEVERAGE
         
-        # Check if we have enough available margin
-        if required_margin > available_balance * 0.95:  # Leave 5% buffer
+        if required_margin > available_balance * 0.95:
             print(f"❌ Insufficient available margin.")
             print(f"   Required: {required_margin:.2f} USDT")
             print(f"   Available: {available_balance:.2f} USDT")
@@ -223,13 +361,10 @@ def place_trade(signal):
             error_msg = str(e)
             print(f"⚠ Warning: Could not set stop loss - {e}")
             
-            # Check if it's the "would immediately trigger" error
             if "-2021" in error_msg or "immediately trigger" in error_msg:
                 print(f"⚠ Stop loss price ({stop_loss}) would trigger immediately!")
                 print(f"   Current market has likely moved past your stop loss.")
-                print(f"   Consider adjusting your stop loss distance or skip this trade.")
             
-            # Cancel entry order if SL fails
             print(f"⚠ Attempting to cancel entry order {order['orderId']}...")
             try:
                 cancel_response = client.futures_cancel_order(
@@ -240,7 +375,6 @@ def place_trade(signal):
                 return
             except Exception as cancel_error:
                 cancel_error_msg = str(cancel_error)
-                # Check if order already filled
                 if "-2011" in cancel_error_msg or "Unknown order" in cancel_error_msg:
                     print(f"⚠ Entry order already filled or doesn't exist!")
                     print(f"⚠ WARNING: You may have an open position WITHOUT stop loss!")
@@ -271,6 +405,16 @@ def place_trade(signal):
                 print(f"⚠ Take profit price ({take_profit}) would trigger immediately!")
             
             print(f"ℹ Stop Loss is still active at {stop_loss}")
+        
+        # Track this position
+        open_positions[symbol_base] = {
+            'side': side,
+            'sl_order_id': sl_order_id,
+            'tp_order_id': tp_order_id,
+            'qty': qty,
+            'entry_price': actual_entry
+        }
+        print(f"✓ Position tracked for {symbol_base}")
             
     except Exception as e:
         print(f"❌ Error placing trade: {e}")
@@ -288,8 +432,14 @@ async def main():
     async for msg in tg.iter_messages(entity, reply_to=topic_id, limit=10):
         if msg.text:
             parsed = extract_signal(msg.text, msg.date)
-            if parsed["symbol"] and parsed["side"] and parsed["entry"]:
-                print("Signal found:", parsed)
+            
+            # Handle close signals
+            if parsed["is_close"] and parsed["symbol"]:
+                print("Close signal found:", parsed)
+                close_position(parsed)
+            # Handle trading signals
+            elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
+                print("Trading signal found:", parsed)
                 place_trade(parsed)
 
     # Listen for new signals
@@ -297,11 +447,18 @@ async def main():
     async def handler(event):
         if event.message.reply_to and event.message.reply_to.reply_to_msg_id == topic_id:
             parsed = extract_signal(event.message.text or "", event.message.date)
-            if parsed["symbol"] and parsed["side"] and parsed["entry"]:
-                print("NEW SIGNAL:", parsed)
+            
+            # Handle close signals
+            if parsed["is_close"] and parsed["symbol"]:
+                print("NEW CLOSE SIGNAL:", parsed)
+                close_position(parsed)
+            # Handle trading signals
+            elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
+                print("NEW TRADING SIGNAL:", parsed)
                 place_trade(parsed)
 
     print("Listening for new messages...\n")
+    print(f"Currently tracking {len(open_positions)} open positions")
     await tg.run_until_disconnected()
 
 asyncio.run(main())
