@@ -19,6 +19,7 @@ client = Client(binance_api_key, binance_api_secret, testnet=False)
 RISK_PER_TRADE = 0.05
 LEVERAGE = 10
 RR_RATIO = 1.0
+EXPECTED_SIGNALS_PER_DAY = 6  # Reserve balance for this many signals
 
 # Track open positions with their order IDs
 open_positions = {}  # {symbol: {'side': 'LONG', 'sl_order_id': 123, 'tp_order_id': 456, 'qty': 0.5}}
@@ -209,6 +210,63 @@ def place_trade(signal):
             print(f"  Skipping new {side} signal")
             return
         
+        # ========== EARLY BALANCE CHECK ==========
+        print(f"\n{'='*50}")
+        print(f"📊 PRE-TRADE BALANCE CHECK for {symbol}")
+        print(f"{'='*50}")
+        
+        try:
+            account = client.futures_account_balance()
+            usdt_balance = float(next(b for b in account if b['asset'] == 'USDT')['balance'])
+            
+            account_info = client.futures_account()
+            available_balance = float(account_info['availableBalance'])
+            
+            print(f"Total Balance: {usdt_balance:.2f} USDT")
+            print(f"Available Balance: {available_balance:.2f} USDT")
+            print(f"Already in Positions: {len(open_positions)}")
+            
+            # Calculate if we have enough for remaining expected signals
+            remaining_signals = EXPECTED_SIGNALS_PER_DAY - len(open_positions)
+            if remaining_signals < 1:
+                remaining_signals = 1  # At least keep buffer for 1 more
+            
+            # Reserve balance for future signals
+            reserved_balance = available_balance / remaining_signals
+            risk_amount = usdt_balance * RISK_PER_TRADE
+            
+            # Estimate required margin (approximate)
+            estimated_position_value = (risk_amount / 0.01) * 1.1  # 1% SL, 10% buffer
+            estimated_margin_needed = estimated_position_value / LEVERAGE
+            
+            print(f"Risk per trade: {risk_amount:.2f} USDT ({RISK_PER_TRADE*100}%)")
+            print(f"Estimated margin needed: {estimated_margin_needed:.2f} USDT")
+            print(f"Balance per signal (reserved): {reserved_balance:.2f} USDT")
+            print(f"Remaining signals to account for: {remaining_signals}")
+            
+            # Check if we have enough margin
+            if estimated_margin_needed > reserved_balance:
+                print(f"\n❌ INSUFFICIENT BALANCE - TRADE REJECTED")
+                print(f"   Reason: Not enough balance to maintain {EXPECTED_SIGNALS_PER_DAY} signals/day capacity")
+                print(f"   Need: {estimated_margin_needed:.2f} USDT")
+                print(f"   Have (per signal): {reserved_balance:.2f} USDT")
+                print(f"   Consider: Reduce position sizes or close existing positions")
+                print(f"{'='*50}\n")
+                return
+            
+            if available_balance < estimated_margin_needed * 1.2:  # 20% safety margin
+                print(f"\n⚠️  WARNING: Low available balance!")
+                print(f"   Continuing with reduced position size")
+                
+        except Exception as e:
+            print(f"❌ Error checking balance: {e}")
+            print(f"   Aborting trade for safety")
+            print(f"{'='*50}\n")
+            return
+        
+        print(f"✓ Balance check passed - proceeding with trade")
+        print(f"{'='*50}\n")
+        
         # Convert LONG/SHORT to BUY/SELL for Binance API
         binance_side = "BUY" if side == "LONG" else "SELL"
 
@@ -225,31 +283,30 @@ def place_trade(signal):
                 break
         
         if not symbol_info:
-            print(f"Error: Symbol {symbol} not found on Binance Futures")
+            print(f"❌ Symbol {symbol} not found on Binance Futures")
             return
 
-        # --- Set Leverage ---
+        # --- Set Leverage (silently) ---
         try:
             client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-            print(f"Leverage set to {LEVERAGE}x for {symbol}")
         except Exception as e:
-            print(f"Warning: Could not set leverage - {e}")
+            print(f"⚠ Could not set leverage: {e}")
 
-        # --- Risk Management ---
-        account = client.futures_account_balance()
-        usdt_balance = float(next(b for b in account if b['asset'] == 'USDT')['balance'])
-        
-        account_info = client.futures_account()
-        available_balance = float(account_info['availableBalance'])
-        
-        if available_balance <= 0:
-            print("Error: Insufficient available balance")
-            return
-        
+        # --- Risk Management with Balance Reservation ---
         risk_per_trade = usdt_balance * RISK_PER_TRADE
         stop_loss_pct = 0.01
         
-        position_value = (risk_per_trade / stop_loss_pct)
+        # Calculate position size with buffer for multiple signals
+        remaining_signals = EXPECTED_SIGNALS_PER_DAY - len(open_positions)
+        if remaining_signals < 1:
+            remaining_signals = 1
+        
+        # Limit position value to ensure we can take more trades
+        max_position_value = (available_balance / remaining_signals) * LEVERAGE * 0.85  # 15% safety buffer
+        calculated_position_value = (risk_per_trade / stop_loss_pct)
+        
+        # Use the smaller of the two
+        position_value = min(calculated_position_value, max_position_value)
         qty = position_value / entry_price
             
         # --- Get current market price ---
@@ -293,15 +350,14 @@ def place_trade(signal):
         if not use_market_order:
             entry_price = round_step_size(entry_price, tick_size)
         
-        position_value = qty * entry_price
+        position_value = qty * actual_entry
         required_margin = position_value / LEVERAGE
         
-        if required_margin > available_balance * 0.95:
-            print(f"❌ Insufficient available margin.")
-            print(f"   Required: {required_margin:.2f} USDT")
+        # Final margin check (should pass since we pre-checked)
+        if required_margin > available_balance * 0.80:  # Use max 80% per trade
+            print(f"❌ Position size too large after calculations")
+            print(f"   Required margin: {required_margin:.2f} USDT")
             print(f"   Available: {available_balance:.2f} USDT")
-            print(f"   Total Balance: {usdt_balance:.2f} USDT")
-            print(f"   (Margin already used in other positions)")
             return
 
         print(f"\n{'='*50}")
@@ -310,8 +366,6 @@ def place_trade(signal):
             print(f"Entry: MARKET (~{current_price}), Stop: {stop_loss}, TP: {take_profit}, Qty: {qty}")
         else:
             print(f"Entry: {entry_price}, Stop: {stop_loss}, TP: {take_profit}, Qty: {qty}")
-        print(f"Total Balance: {usdt_balance:.2f} USDT")
-        print(f"Available Balance: {available_balance:.2f} USDT")
         print(f"Position Value: {position_value:.2f} USDT")
         print(f"Required Margin: {required_margin:.2f} USDT")
         print(f"Risk Amount: {risk_per_trade:.2f} USDT ({RISK_PER_TRADE*100}%)")
@@ -428,21 +482,10 @@ async def main():
     await tg.start()
     entity = await tg.get_entity(group_id)
 
-    print("Fetching past signals...\n")
-    async for msg in tg.iter_messages(entity, reply_to=topic_id, limit=10):
-        if msg.text:
-            parsed = extract_signal(msg.text, msg.date)
-            
-            # Handle close signals
-            if parsed["is_close"] and parsed["symbol"]:
-                print("Close signal found:", parsed)
-                close_position(parsed)
-            # Handle trading signals
-            elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
-                print("Trading signal found:", parsed)
-                place_trade(parsed)
+    print("Bot started - listening for NEW messages only (no historical fetch)")
+    print(f"Currently tracking {len(open_positions)} open positions\n")
 
-    # Listen for new signals
+    # Listen for new signals only
     @tg.on(events.NewMessage(chats=entity))
     async def handler(event):
         if event.message.reply_to and event.message.reply_to.reply_to_msg_id == topic_id:
@@ -458,7 +501,6 @@ async def main():
                 place_trade(parsed)
 
     print("Listening for new messages...\n")
-    print(f"Currently tracking {len(open_positions)} open positions")
     await tg.run_until_disconnected()
 
 asyncio.run(main())
