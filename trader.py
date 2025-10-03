@@ -7,7 +7,7 @@ import asyncio
 # ========== TELEGRAM ==========
 api_id = 23008284
 api_hash = "9b753f6de26369ddff1f498ce4d21fb5"
-session_name = "my_session"
+session_name = "trader_session"  # Unique session for trader
 group_id = -1002039861131
 topic_id = 40011
 
@@ -16,7 +16,7 @@ binance_api_key = "9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJ
 binance_api_secret = "mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl"
 client = Client(binance_api_key, binance_api_secret, testnet=False)
 
-RISK_PER_TRADE = 0.05
+RISK_PER_TRADE = 0.2
 LEVERAGE = 10
 RR_RATIO = 1.0
 EXPECTED_SIGNALS_PER_DAY = 6  # Reserve balance for this many signals
@@ -478,29 +478,45 @@ def place_trade(signal):
 
 # ---------- Telegram Integration ----------
 async def main():
-    tg = TelegramClient(session_name, api_id, api_hash)
-    await tg.start()
-    entity = await tg.get_entity(group_id)
+    tg = None
+    try:
+        tg = TelegramClient(session_name, api_id, api_hash)
+        await tg.start()
+        entity = await tg.get_entity(group_id)
 
-    print("Bot started - listening for NEW messages only (no historical fetch)")
-    print(f"Currently tracking {len(open_positions)} open positions\n")
+        print("Bot started - listening for NEW messages only (no historical fetch)")
+        print(f"Currently tracking {len(open_positions)} open positions\n")
 
-    # Listen for new signals only
-    @tg.on(events.NewMessage(chats=entity))
-    async def handler(event):
-        if event.message.reply_to and event.message.reply_to.reply_to_msg_id == topic_id:
-            parsed = extract_signal(event.message.text or "", event.message.date)
-            
-            # Handle close signals
-            if parsed["is_close"] and parsed["symbol"]:
-                print("NEW CLOSE SIGNAL:", parsed)
-                close_position(parsed)
-            # Handle trading signals
-            elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
-                print("NEW TRADING SIGNAL:", parsed)
-                place_trade(parsed)
+        # Listen for new signals only
+        @tg.on(events.NewMessage(chats=entity))
+        async def handler(event):
+            if event.message.reply_to and event.message.reply_to.reply_to_msg_id == topic_id:
+                parsed = extract_signal(event.message.text or "", event.message.date)
+                
+                # Handle close signals
+                if parsed["is_close"] and parsed["symbol"]:
+                    print("NEW CLOSE SIGNAL:", parsed)
+                    close_position(parsed)
+                # Handle trading signals
+                elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
+                    print("NEW TRADING SIGNAL:", parsed)
+                    place_trade(parsed)
 
-    print("Listening for new messages...\n")
-    await tg.run_until_disconnected()
+        print("Listening for new messages...\n")
+        await tg.run_until_disconnected()
+    
+    except Exception as e:
+        print(f"❌ Error in trader main: {e}")
+    finally:
+        if tg and tg.is_connected():
+            print("🔌 Disconnecting Telegram client...")
+            await tg.disconnect()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Trading bot stopped by user")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
