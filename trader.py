@@ -3,6 +3,10 @@ from binance.client import Client
 from binance.enums import *
 import re
 import asyncio
+import logging
+from datetime import datetime
+import os
+import time
 
 # ========== TELEGRAM ==========
 api_id = 23008284
@@ -21,11 +25,115 @@ LEVERAGE = 10
 RR_RATIO = 1.0
 EXPECTED_SIGNALS_PER_DAY = 6  # Reserve balance for this many signals
 
-# Track open positions with their order IDs
-open_positions = {}  # {symbol: {'side': 'LONG', 'sl_order_id': 123, 'tp_order_id': 456, 'qty': 0.5}}
+# ========== LOGGING SETUP ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler('trader_messages.log', encoding='utf-8')  # File output
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== SESSION MANAGEMENT ==========
+def cleanup_session_files():
+    """Clean up session files if they exist and might be corrupted"""
+    session_files = [f"{session_name}.session", f"{session_name}.session-journal"]
+    for file_path in session_files:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"🧹 Cleaned up session file: {file_path}")
+                logger.info(f"SESSION CLEANUP: Removed {file_path}")
+            except Exception as e:
+                print(f"⚠ Could not remove {file_path}: {e}")
+
+def create_safe_telegram_client():
+    """Create a Telegram client with better error handling"""
+    try:
+        # Add a small delay to ensure no conflicts
+        time.sleep(1)
+        
+        client = TelegramClient(
+            session_name, 
+            api_id, 
+            api_hash,
+            # Add session parameters for better stability
+            device_model="Trading Bot",
+            system_version="1.0",
+            app_version="1.0",
+            lang_code="en",
+            system_lang_code="en"
+        )
+        return client
+    except Exception as e:
+        print(f"❌ Error creating Telegram client: {e}")
+        logger.error(f"CLIENT CREATION ERROR: {e}")
+        return None
+
+# ---------- Binance Position Tracking Functions ----------
+def get_open_positions():
+    """Get all open positions from Binance API"""
+    try:
+        positions = client.futures_position_information()
+        open_pos = {}
+        for pos in positions:
+            if float(pos['positionAmt']) != 0:
+                symbol_base = pos['symbol'].replace('USDT', '')
+                open_pos[symbol_base] = {
+                    'side': 'LONG' if float(pos['positionAmt']) > 0 else 'SHORT',
+                    'qty': abs(float(pos['positionAmt'])),
+                    'entry_price': float(pos['entryPrice']),
+                    'symbol': pos['symbol']
+                }
+        return open_pos
+    except Exception as e:
+        print(f"❌ Error getting positions: {e}")
+        return {}
+
+def get_open_orders_for_symbol(symbol):
+    """Get all open orders for a specific symbol"""
+    try:
+        orders = client.futures_get_open_orders(symbol=symbol)
+        return orders
+    except Exception as e:
+        print(f"❌ Error getting orders for {symbol}: {e}")
+        return []
+
+def log_message_and_signal(message_text, parsed_signal, event_time):
+    """Log every message and its signal extraction result"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Create a clean message preview (first 100 chars)
+    message_preview = (message_text[:100] + '...') if len(message_text) > 100 else message_text
+    message_preview = message_preview.replace('\n', ' ').replace('\r', ' ')  # Remove newlines
+    
+    # Determine signal type
+    if parsed_signal["is_close"] and parsed_signal["symbol"]:
+        signal_type = "CLOSE_SIGNAL"
+        signal_details = f"Symbol: {parsed_signal['symbol']}"
+    elif parsed_signal["symbol"] and parsed_signal["side"] and parsed_signal["entry"]:
+        signal_type = "TRADING_SIGNAL"
+        signal_details = f"Symbol: ${parsed_signal['symbol']}, Side: {parsed_signal['side']}, Entry: {parsed_signal['entry']}"
+    else:
+        signal_type = "NO_SIGNAL"
+        signal_details = "No valid signal detected"
+    
+    # Log to file and console
+    log_entry = f"[{timestamp}] MESSAGE: '{message_preview}' | SIGNAL: {signal_type} | DETAILS: {signal_details}"
+    logger.info(log_entry)
+    
+    # Also print to console with formatting
+    print(f"\n📨 MESSAGE LOGGED: {timestamp}")
+    print(f"📝 Content: {message_preview}")
+    print(f"🔍 Signal: {signal_type}")
+    print(f"📊 Details: {signal_details}")
+    print("-" * 60)
 
 # ---------- Signal Extraction ----------
 def extract_signal(text, time):
+    """Extract trading signal from message text - EXACT COPY from working tester script"""
     signal = {
         "time": str(time),
         "symbol": None,
@@ -34,37 +142,75 @@ def extract_signal(text, time):
         "is_close": False
     }
 
-    # Check if this is a close signal
+    if not text or len(text.strip()) == 0:
+        return signal
+
+    # Check for close signal
     if re.search(r'\bclose\b', text, re.IGNORECASE):
         signal["is_close"] = True
-        # Extract symbol from close signal (e.g., "XLM + 21.4% profit" or "Close XLM")
         match_symbol = re.findall(r'\b([A-Z]{2,6})\b', text)
         if match_symbol:
             signal["symbol"] = match_symbol[0]
         return signal
 
-    # SIDE
-    if "LONG" in text.upper():
+    # Extract SIDE (LONG/SHORT)
+    if re.search(r'\bLONG\b', text, re.IGNORECASE):
         signal["side"] = "LONG"
-    elif "SHORT" in text.upper():
+    elif re.search(r'\bSHORT\b', text, re.IGNORECASE):
         signal["side"] = "SHORT"
 
-    # SYMBOL
-    match_symbol = re.findall(r"\$([A-Z]{2,6})", text)
+    # Extract SYMBOL
+    match_symbol = re.findall(r"\$([A-Z]{2,10})", text)
     if match_symbol:
         signal["symbol"] = match_symbol[0]
+    else:
+        # Try patterns without $ prefix
+        symbol_patterns = [
+            r'^([A-Z]{3,10})\s*$',
+            r'^([A-Z]{3,10})\s*\n',
+            r'\b([A-Z]{3,10})(?=\s*(?:LONG|SHORT))',
+            r'(?:^|\s)([A-Z]{3,10})(?=\s*[-:])',
+            r'\b([A-Z]{3,10})\b(?=.*Entry)',
+        ]
+        
+        excluded = {'ENTRY', 'LONG', 'SHORT', 'STOP', 'TAKE', 'PROFIT', 'LOSS', 'SWING', 'ORDER', 'SMALL', 'VOL'}
+        
+        for pattern in symbol_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+            if matches:
+                for match in matches:
+                    if match.upper() not in excluded and len(match) >= 3:
+                        signal["symbol"] = match.upper()
+                        break
+                if signal["symbol"]:
+                    break
 
-    # ENTRIES - improved pattern and validation
-    match_entries = re.findall(r"Entry(?:\s*limit)?[:\s]+([\d]+\.?[\d]*)", text, re.IGNORECASE)
-    if match_entries:
-        for x in match_entries:
-            try:
-                price = float(x)
-                if price > 0:
-                    signal["entry"].append(price)
-            except (ValueError, TypeError):
-                pass
-
+    # Extract ENTRY prices
+    entry_patterns = [
+        r"(?:LONG|SHORT)\s*-\s*Entry[\s:]*([\d]+\.?[\d]*)",
+        r"Entry[\s:]*([\d]+\.?[\d]*)",
+        r"Entry[\s:]*limit[\s:]*([\d]+\.?[\d]*)",
+        r"-\s*Entry[\s:]*([\d]+\.?[\d]*)",
+        r"([\d]+\.?[\d]+)\s*(?:entry|ent)",
+        r"@\s*([\d]+\.?[\d]+)",
+    ]
+    
+    for pattern in entry_patterns:
+        match_entries = re.findall(pattern, text, re.IGNORECASE)
+        if match_entries:
+            for x in match_entries:
+                try:
+                    price = float(x)
+                    if price > 0:
+                        signal["entry"].append(price)
+                except (ValueError, TypeError):
+                    continue
+            if signal["entry"]:
+                break
+    
+    # Log what we extracted for debugging
+    logger.info(f"EXTRACTED: Symbol={signal['symbol']}, Side={signal['side']}, Entry={signal['entry']}, Close={signal['is_close']}")
+    
     return signal
 
 # ---------- Close Position Function ----------
@@ -73,103 +219,51 @@ def close_position(signal):
     symbol_base = signal['symbol']
     symbol = f"{symbol_base}USDT"
     
+    # Get current positions from Binance
+    open_positions = get_open_positions()
+    
     if symbol_base not in open_positions:
-        print(f"⚠ No tracked position found for {symbol_base}")
-        print(f"  Checking Binance for any open positions...")
-        
-        # Check if there's actually an open position on Binance
-        try:
-            positions = client.futures_position_information(symbol=symbol)
-            for pos in positions:
-                if float(pos['positionAmt']) != 0:
-                    print(f"  Found open position on Binance!")
-                    # We'll close it anyway even if not tracked
-                    break
-            else:
-                print(f"  No open position found on Binance either.")
-                return
-        except Exception as e:
-            print(f"❌ Error checking position: {e}")
-            return
+        print(f"⚠ No open position found for {symbol_base}")
+        return
     
     try:
         print(f"\n{'='*50}")
         print(f"🔒 CLOSE SIGNAL DETECTED for {symbol_base}")
         print(f"{'='*50}")
         
-        # Get current position info from Binance
-        positions = client.futures_position_information(symbol=symbol)
-        position = None
-        for pos in positions:
-            if float(pos['positionAmt']) != 0:
-                position = pos
-                break
-        
-        if not position:
-            print(f"⚠ No open position found on Binance for {symbol}")
-            # Clean up tracking
-            if symbol_base in open_positions:
-                del open_positions[symbol_base]
-            return
-        
-        position_amt = float(position['positionAmt'])
-        entry_price = float(position['entryPrice'])
+        position_data = open_positions[symbol_base]
         
         # Get current market price
         ticker = client.futures_symbol_ticker(symbol=symbol)
         current_price = float(ticker['price'])
         
         # Calculate P&L
-        if position_amt > 0:  # LONG position
-            pnl = (current_price - entry_price) * abs(position_amt)
-            side_text = "LONG"
-        else:  # SHORT position
-            pnl = (entry_price - current_price) * abs(position_amt)
-            side_text = "SHORT"
+        if position_data['side'] == 'LONG':
+            pnl = (current_price - position_data['entry_price']) * position_data['qty']
+        else:  # SHORT
+            pnl = (position_data['entry_price'] - current_price) * position_data['qty']
         
-        print(f"Position: {side_text}")
-        print(f"Entry Price: {entry_price}")
+        print(f"Position: {position_data['side']}")
+        print(f"Entry Price: {position_data['entry_price']}")
         print(f"Current Price: {current_price}")
-        print(f"Quantity: {abs(position_amt)}")
+        print(f"Quantity: {position_data['qty']}")
         print(f"Estimated P&L: {pnl:+.2f} USDT")
         
-        # Cancel all open orders for this symbol (SL and TP)
-        if symbol_base in open_positions:
-            pos_data = open_positions[symbol_base]
-            
-            # Cancel Stop Loss
-            if pos_data.get('sl_order_id'):
-                try:
-                    client.futures_cancel_order(symbol=symbol, orderId=pos_data['sl_order_id'])
-                    print(f"✓ Cancelled Stop Loss order {pos_data['sl_order_id']}")
-                except Exception as e:
-                    if "-2011" not in str(e):  # Ignore "Unknown order" error
-                        print(f"⚠ Could not cancel SL: {e}")
-            
-            # Cancel Take Profit
-            if pos_data.get('tp_order_id'):
-                try:
-                    client.futures_cancel_order(symbol=symbol, orderId=pos_data['tp_order_id'])
-                    print(f"✓ Cancelled Take Profit order {pos_data['tp_order_id']}")
-                except Exception as e:
-                    if "-2011" not in str(e):
-                        print(f"⚠ Could not cancel TP: {e}")
-        else:
-            # Try to cancel all open orders for this symbol
-            try:
-                client.futures_cancel_all_open_orders(symbol=symbol)
-                print(f"✓ Cancelled all open orders for {symbol}")
-            except Exception as e:
-                print(f"⚠ Could not cancel orders: {e}")
+        # Cancel all open orders for this symbol
+        try:
+            client.futures_cancel_all_open_orders(symbol=symbol)
+            print(f"✓ Cancelled all open orders for {symbol}")
+        except Exception as e:
+            print(f"⚠ Could not cancel orders: {e}")
         
         # Close position at market price
-        close_side = "SELL" if position_amt > 0 else "BUY"
+        close_side = "SELL" if position_data['side'] == 'LONG' else "BUY"
         
         order = client.futures_create_order(
             symbol=symbol,
             side=close_side,
             type="MARKET",
-            quantity=abs(position_amt),
+            quantity=position_data['qty'],
             reduceOnly=True
         )
         
@@ -177,10 +271,8 @@ def close_position(signal):
         print(f"  Order ID: {order['orderId']}")
         print(f"{'='*50}\n")
         
-        # Remove from tracking
-        if symbol_base in open_positions:
-            del open_positions[symbol_base]
-            print(f"✓ Removed {symbol_base} from position tracking")
+        # Log successful position close
+        logger.info(f"POSITION CLOSED: {position_data['side']} {symbol_base} at {current_price} | P&L: {pnl:+.2f} USDT | Order: {order['orderId']}")
         
     except Exception as e:
         print(f"❌ Error closing position for {symbol_base}: {e}")
@@ -205,8 +297,10 @@ def place_trade(signal):
         entry_price = signal['entry'][0]
         
         # Check if we already have a position for this symbol
+        open_positions = get_open_positions()
         if symbol_base in open_positions:
             print(f"⚠ Already have an open position for {symbol_base}")
+            print(f"  Current: {open_positions[symbol_base]['side']}")
             print(f"  Skipping new {side} signal")
             return
         
@@ -460,15 +554,11 @@ def place_trade(signal):
             
             print(f"ℹ Stop Loss is still active at {stop_loss}")
         
-        # Track this position
-        open_positions[symbol_base] = {
-            'side': side,
-            'sl_order_id': sl_order_id,
-            'tp_order_id': tp_order_id,
-            'qty': qty,
-            'entry_price': actual_entry
-        }
-        print(f"✓ Position tracked for {symbol_base}")
+        print(f"✓ Trade executed for {symbol_base} - {side}")
+        print(f"✓ Position will be tracked via Binance API")
+        
+        # Log successful trade execution
+        logger.info(f"TRADE EXECUTED: {side} {symbol_base} at {actual_entry} | SL: {stop_loss} | TP: {take_profit} | Qty: {qty}")
             
     except Exception as e:
         print(f"❌ Error placing trade: {e}")
@@ -479,38 +569,148 @@ def place_trade(signal):
 # ---------- Telegram Integration ----------
 async def main():
     tg = None
-    try:
-        tg = TelegramClient(session_name, api_id, api_hash)
-        await tg.start()
-        entity = await tg.get_entity(group_id)
-
-        print("Bot started - listening for NEW messages only (no historical fetch)")
-        print(f"Currently tracking {len(open_positions)} open positions\n")
-
-        # Listen for new signals only
-        @tg.on(events.NewMessage(chats=entity))
-        async def handler(event):
-            if event.message.reply_to and event.message.reply_to.reply_to_msg_id == topic_id:
-                parsed = extract_signal(event.message.text or "", event.message.date)
-                
-                # Handle close signals
-                if parsed["is_close"] and parsed["symbol"]:
-                    print("NEW CLOSE SIGNAL:", parsed)
-                    close_position(parsed)
-                # Handle trading signals
-                elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
-                    print("NEW TRADING SIGNAL:", parsed)
-                    place_trade(parsed)
-
-        print("Listening for new messages...\n")
-        await tg.run_until_disconnected()
+    max_retries = 3
+    retry_count = 0
     
-    except Exception as e:
-        print(f"❌ Error in trader main: {e}")
-    finally:
-        if tg and tg.is_connected():
+    while retry_count < max_retries:
+        try:
+            # Clean up any existing session files on first attempt
+            if retry_count == 0:
+                cleanup_session_files()
+                time.sleep(2)  # Give some time for cleanup
+            
+            print(f"🔄 Attempt {retry_count + 1}/{max_retries} - Creating Telegram client...")
+            
+            tg = create_safe_telegram_client()
+            if tg is None:
+                raise Exception("Failed to create Telegram client")
+            
+            print("🔗 Starting Telegram client...")
+            await tg.start()
+            
+            print("🔍 Getting entity...")
+            entity = await tg.get_entity(group_id)
+            
+            print("🤖 Bot started - listening for NEW messages from ALL TOPICS")
+            print("📝 All messages and signals will be logged to 'trader_messages.log'")
+            print(f"🎯 Primary target topic: {topic_id} (but monitoring all topics for signals)")
+            
+            # Show current positions from Binance
+            current_positions = get_open_positions()
+            print(f"📊 Currently tracking {len(current_positions)} open positions from Binance:")
+            for symbol, pos in current_positions.items():
+                print(f"  {symbol}: {pos['side']} @ {pos['entry_price']} (Qty: {pos['qty']})")
+            print()
+            
+            # Log startup
+            logger.info(f"TRADER BOT STARTED - Monitoring {len(current_positions)} positions")
+            
+            # Listen for new signals only
+            @tg.on(events.NewMessage(chats=entity))
+            async def handler(event):
+                # Process ALL messages with reply_to (any topic), not just specific topic
+                if event.message.reply_to and event.message.reply_to.reply_to_msg_id:
+                    topic_id_found = event.message.reply_to.reply_to_msg_id
+                    
+                    # Extract text from message - use same logic as working tester
+                    message_text = ""
+                    
+                    # Simple, reliable extraction like in tester script
+                    if hasattr(event.message, 'text') and event.message.text:
+                        message_text = event.message.text
+                    elif hasattr(event.message, 'caption') and event.message.caption:
+                        message_text = event.message.caption
+                    
+                    # Skip processing if no text content
+                    if not message_text:
+                        logger.info(f"MESSAGE NO TEXT (Topic ID: {topic_id_found}): Empty message")
+                        return
+                    
+                    # ALWAYS try to extract signal from ANY topic - let signal detection decide if it's valid
+                    parsed = extract_signal(message_text, event.message.date)
+                    
+                    # Log every message and its signal extraction result
+                    log_message_and_signal(message_text, parsed, event.message.date)
+                    
+                    # Handle close signals from ANY topic
+                    if parsed["is_close"] and parsed["symbol"]:
+                        print(f"\n🔒 NEW CLOSE SIGNAL DETECTED (Topic {topic_id_found}):", parsed)
+                        close_position(parsed)
+                    # Handle trading signals from ANY topic  
+                    elif parsed["symbol"] and parsed["side"] and parsed["entry"]:
+                        print(f"\n📈 NEW TRADING SIGNAL DETECTED (Topic {topic_id_found}):", parsed)
+                        place_trade(parsed)
+                    else:
+                        # Only log detailed rejection for original target topic to reduce noise
+                        if topic_id_found == topic_id:
+                            reasons = []
+                            if not parsed["symbol"]:
+                                reasons.append("missing symbol")
+                            if not parsed["side"] and not parsed["is_close"]:
+                                reasons.append("missing side (LONG/SHORT)")
+                            if not parsed["entry"] and not parsed["is_close"]:
+                                reasons.append("missing entry price")
+                            
+                            logger.info(f"SIGNAL REJECTED (Topic {topic_id_found}): {', '.join(reasons)}")
+                            print(f"⚠️ Signal rejected (Topic {topic_id_found}): {', '.join(reasons)}")
+                        else:
+                            # Just log as regular message for other topics
+                            logger.info(f"MESSAGE NO SIGNAL (Topic ID: {topic_id_found}): '{message_text[:50]}...'")
+                else:
+                    # Log messages not in any topic (simple approach like tester)
+                    message_text = "[No text]"
+                    if hasattr(event.message, 'text') and event.message.text:
+                        message_text = event.message.text
+                    elif hasattr(event.message, 'caption') and event.message.caption:
+                        message_text = event.message.caption
+                    
+                    logger.info(f"MESSAGE NOT IN ANY TOPIC: '{message_text[:50]}...'")
+                    print(f"💬 Message not in any topic")
+            
+            print("👂 Listening for new messages...\n")
+            await tg.run_until_disconnected()
+            
+            # If we reach here, connection was successful and then disconnected normally
+            break
+            
+        except Exception as e:
+            retry_count += 1
+            error_msg = str(e)
+            
+            print(f"❌ Error in trader main (attempt {retry_count}/{max_retries}): {e}")
+            logger.error(f"TRADER ERROR (attempt {retry_count}): {e}")
+            
+            # Clean up the current client
+            if tg:
+                try:
+                    if tg.is_connected():
+                        await tg.disconnect()
+                except:
+                    pass
+                tg = None
+            
+            # If it's a database lock error, clean up session files
+            if "database is locked" in error_msg.lower():
+                print("🧹 Database lock detected - cleaning up session files...")
+                cleanup_session_files()
+                time.sleep(3)  # Wait longer for database lock to clear
+            
+            if retry_count < max_retries:
+                wait_time = retry_count * 5  # Increasing wait time
+                print(f"⏳ Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            else:
+                print("❌ Maximum retries reached. Exiting.")
+                logger.error("TRADER FAILED: Maximum retries reached")
+    
+    # Final cleanup
+    if tg and tg.is_connected():
+        try:
             print("🔌 Disconnecting Telegram client...")
+            logger.info("TRADER BOT STOPPED - Disconnecting...")
             await tg.disconnect()
+        except Exception as e:
+            print(f"⚠ Error during final disconnect: {e}")
 
 if __name__ == "__main__":
     try:
