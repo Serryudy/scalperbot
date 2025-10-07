@@ -79,6 +79,30 @@ class TradingDatabase:
                 processed_at TIMESTAMP NOT NULL
             )
         ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS detected_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_hash TEXT UNIQUE NOT NULL,
+                signal_type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                entry_price REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                profit_percentage REAL,
+                detected_at TIMESTAMP NOT NULL,
+                message_text TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+        ''')
         self.conn.commit()
     
     def is_position_open(self, symbol):
@@ -124,6 +148,76 @@ class TradingDatabase:
             VALUES (?, ?)
         ''', (signal_hash, datetime.now(timezone.utc)))
         self.conn.commit()
+    
+    def save_detected_signal(self, signal, signal_hash, message_text, status='pending'):
+        """Save a detected signal to the database"""
+        cursor = self.conn.cursor()
+        if signal['type'] == 'LONG':
+            cursor.execute('''
+                INSERT OR IGNORE INTO detected_signals 
+                (signal_hash, signal_type, symbol, entry_price, stop_loss, take_profit, 
+                 detected_at, message_text, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (signal_hash, signal['type'], signal['symbol'], signal['entry_price'],
+                  signal['stop_loss'], signal['take_profit'], datetime.now(timezone.utc),
+                  message_text, status))
+        else:  # CLOSE
+            cursor.execute('''
+                INSERT OR IGNORE INTO detected_signals 
+                (signal_hash, signal_type, symbol, profit_percentage, 
+                 detected_at, message_text, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (signal_hash, signal['type'], signal['symbol'], 
+                  signal.get('profit_percentage', 0), datetime.now(timezone.utc),
+                  message_text, status))
+        self.conn.commit()
+    
+    def is_signal_detected(self, signal_hash):
+        """Check if signal was already detected"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM detected_signals 
+            WHERE signal_hash = ?
+        ''', (signal_hash,))
+        return cursor.fetchone()[0] > 0
+    
+    def update_signal_status(self, signal_hash, status):
+        """Update status of a detected signal"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE detected_signals 
+            SET status = ?
+            WHERE signal_hash = ?
+        ''', (status, signal_hash))
+        self.conn.commit()
+    
+    def get_setting(self, key, default=None):
+        """Get a setting value"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+        result = cursor.fetchone()
+        return result[0] if result else default
+    
+    def set_setting(self, key, value):
+        """Set a setting value"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+        ''', (key, value, datetime.now(timezone.utc)))
+        self.conn.commit()
+    
+    def is_first_run_today(self):
+        """Check if this is the first run of the current day"""
+        last_run = self.get_setting('last_run_date')
+        today = datetime.now(timezone.utc).date().isoformat()
+        return last_run != today
+    
+    def mark_run_completed(self):
+        """Mark that a run has been completed for today"""
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.set_setting('last_run_date', today)
+        self.set_setting('initial_setup_done', 'true')
 
 class SignalExtractor:
     @staticmethod
@@ -135,16 +229,21 @@ class SignalExtractor:
         if 'LONG' not in text_upper:
             return None
         
-        # Extract symbol (common patterns: LONG - $API3, LONG $API3, etc.)
-        symbol_pattern = r'(?:LONG\s*-?\s*\$?)([A-Z0-9]{2,10})'
+        # Extract symbol (patterns: LONG - $API3, LONG - **$API3, **LONG - **$API3, etc.)
+        symbol_pattern = r'LONG\s*-\s*\*{0,2}\s*\$([A-Z0-9]{2,15})'
         symbol_match = re.search(symbol_pattern, text_upper)
+        if not symbol_match:
+            # Try alternative pattern without dash
+            symbol_pattern = r'LONG\s*\*{0,2}\s*\$([A-Z0-9]{2,15})'
+            symbol_match = re.search(symbol_pattern, text_upper)
         if not symbol_match:
             return None
         
         symbol = symbol_match.group(1)
         
-        # Extract entry price
-        entry_pattern = r'(?:ENTRY[:\s]*|ENTRYC[:\s]*)(\d+\.?\d*)'
+        # Extract entry price (handle multiple formats)
+        # Format: - Entry: 0.8571 or - Entry: 1.836 (30% VOL)
+        entry_pattern = r'-\s*ENTRY(?:\s*LIMIT)?[:\s]*(\d+\.?\d*)'
         entry_match = re.search(entry_pattern, text_upper)
         if not entry_match:
             return None
@@ -152,7 +251,8 @@ class SignalExtractor:
         entry_price = float(entry_match.group(1))
         
         # Extract stop loss
-        sl_pattern = r'(?:SL[:\s]*)(\d+\.?\d*)'
+        # Format: - SL: 0.8030
+        sl_pattern = r'-\s*SL[:\s]*(\d+\.?\d*)'
         sl_match = re.search(sl_pattern, text_upper)
         if not sl_match:
             return None
@@ -160,7 +260,8 @@ class SignalExtractor:
         stop_loss = float(sl_match.group(1))
         
         # Extract take profit
-        tp_pattern = r'(?:TP[:\s]*)(\d+\.?\d*)'
+        # Format: 🎯 TP: 1.5278
+        tp_pattern = r'(?:🎯|TARGET)?\s*TP[:\s]*(\d+\.?\d*)'
         tp_match = re.search(tp_pattern, text_upper)
         if not tp_match:
             return None
@@ -180,28 +281,30 @@ class SignalExtractor:
         """Extract CLOSE signal details from message"""
         text_upper = text.upper()
         
-        # Check if it contains "close" keyword
-        if 'CLOSE' not in text_upper:
+        # Check if it contains profit update keywords
+        # Patterns: "API3 + 27.1% profit", "MUBARAK + 357% profit, close"
+        if not ('+' in text and '%' in text and 'PROFIT' in text_upper):
             return None
         
-        # Extract symbol
-        symbol_pattern = r'([A-Z0-9]{2,10})\s*\+'
+        # Extract symbol - pattern: SYMBOL + percentage% profit
+        # Look for word before the + sign
+        symbol_pattern = r'([A-Z0-9]{2,15})\s*\+'
         symbol_match = re.search(symbol_pattern, text_upper)
-        if not symbol_match:
-            # Try alternative pattern
-            symbol_pattern = r'-\s*([A-Z0-9]{2,10})'
-            symbol_match = re.search(symbol_pattern, text_upper)
-        
         if not symbol_match:
             return None
         
         symbol = symbol_match.group(1)
         
         # Extract profit percentage
-        profit_pattern = r'\+?\s*(\d+\.?\d*)\s*%'
+        profit_pattern = r'\+\s*(\d+\.?\d*)\s*%'
         profit_match = re.search(profit_pattern, text)
         
         profit_pct = float(profit_match.group(1)) if profit_match else 0
+        
+        # Only treat as CLOSE signal if it explicitly mentions "close" in the message
+        if 'CLOSE' not in text_upper:
+            # This is just a profit update, not a close signal
+            return None
         
         return {
             'type': 'CLOSE',
@@ -449,14 +552,18 @@ class TradingBot:
             logger.error(f"Failed to send email notification: {e}")
     
     async def fetch_recent_messages(self):
-        """Fetch messages from the last 5 minutes"""
+        """Fetch all messages from the start of current day"""
         messages = []
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=TRADING_CONFIG['message_lookback'])
+        
+        # Always fetch all messages from start of current day
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff_time = today_start
+        logger.info(f"Fetching all messages from {cutoff_time} (start of today)")
         
         async for message in self.telegram_client.iter_messages(
             TELEGRAM_CONFIG['group_id'],
             reply_to=TELEGRAM_CONFIG['topic_id'],
-            limit=50
+            limit=None
         ):
             if message.date < cutoff_time:
                 break
@@ -473,10 +580,38 @@ class TradingBot:
         signal_str = f"{signal['type']}_{signal['symbol']}_{message_date}"
         return hash(signal_str)
     
-    async def process_messages(self):
+    async def review_signal_interactive(self, signal, message_text, signal_hash):
+        """Interactive review for first run - ask user to skip or process"""
+        print("\n" + "="*60)
+        print(f"📊 NEW SIGNAL DETECTED")
+        print("="*60)
+        print(f"Type: {signal['type']}")
+        print(f"Symbol: {signal['symbol']}")
+        
+        if signal['type'] == 'LONG':
+            print(f"Entry: ${signal['entry_price']:.4f}")
+            print(f"Stop Loss: ${signal['stop_loss']:.4f}")
+            print(f"Take Profit: ${signal['take_profit']:.4f}")
+        else:
+            print(f"Profit: {signal.get('profit_percentage', 0):+.2f}%")
+        
+        print(f"\nOriginal Message:\n{message_text}")
+        print("="*60)
+        
+        while True:
+            response = input("\nDo you want to process this signal? (y/n/q to quit): ").lower().strip()
+            if response in ['y', 'n', 'q']:
+                return response
+            print("Invalid input. Please enter 'y' for yes, 'n' for no, or 'q' to quit.")
+    
+    async def process_messages(self, is_first_run=False):
         """Process messages and execute trades"""
         messages = await self.fetch_recent_messages()
-        logger.info(f"Fetched {len(messages)} messages from last 5 minutes")
+        logger.info(f"Fetched {len(messages)} messages from today")
+        
+        if is_first_run:
+            print(f"\n🔍 INITIAL SETUP MODE - Found {len(messages)} messages from today")
+            print("You will be asked to review each signal individually.\n")
         
         for msg in reversed(messages):  # Process oldest first
             text = msg['text']
@@ -487,6 +622,10 @@ class TradingBot:
             if long_signal:
                 signal_hash = self.generate_signal_hash(long_signal, msg_date)
                 
+                # Save detected signal to database
+                if not self.db.is_signal_detected(signal_hash):
+                    self.db.save_detected_signal(long_signal, signal_hash, text, 'detected')
+                
                 # Check if already processed
                 if self.db.is_signal_processed(signal_hash):
                     logger.info(f"Signal already processed: {long_signal['symbol']}")
@@ -496,7 +635,24 @@ class TradingBot:
                 if self.db.is_position_open(long_signal['symbol']):
                     logger.info(f"Position already open for {long_signal['symbol']}")
                     self.db.mark_signal_processed(signal_hash)
+                    self.db.update_signal_status(signal_hash, 'skipped-position-open')
                     continue
+                
+                # If first run, ask user to review
+                if is_first_run:
+                    response = await self.review_signal_interactive(long_signal, text, signal_hash)
+                    
+                    if response == 'q':
+                        print("\n⚠️  Exiting initial setup. Run the bot again to continue.")
+                        return False  # Signal to stop
+                    
+                    if response == 'n':
+                        logger.info(f"User skipped signal: {long_signal['symbol']}")
+                        self.db.mark_signal_processed(signal_hash)
+                        self.db.update_signal_status(signal_hash, 'skipped-by-user')
+                        continue
+                    
+                    print(f"\n✅ Processing signal for {long_signal['symbol']}...")
                 
                 logger.info(f"New LONG signal detected: {long_signal}")
                 
@@ -522,6 +678,7 @@ class TradingBot:
 """
                     self.send_email_notification(f"🔴 Error Opening Position - {long_signal['symbol']}", error_msg)
                     logger.error(f"Error opening position for {long_signal['symbol']}: {trade_error}")
+                    self.db.update_signal_status(signal_hash, 'error')
                     result = None
                 
                 if result:
@@ -536,6 +693,7 @@ class TradingBot:
                         msg_date
                     )
                     self.db.mark_signal_processed(signal_hash)
+                    self.db.update_signal_status(signal_hash, 'executed')
                     logger.info(f"Position opened and logged: {result['symbol']}")
                     
                     # Send notification
@@ -560,10 +718,18 @@ class TradingBot:
             if close_signal:
                 signal_hash = self.generate_signal_hash(close_signal, msg_date)
                 
+                # Save detected signal to database
+                if not self.db.is_signal_detected(signal_hash):
+                    self.db.save_detected_signal(close_signal, signal_hash, text, 'detected')
+                
                 # Check if already processed
                 if self.db.is_signal_processed(signal_hash):
                     logger.info(f"Close signal already processed: {close_signal['symbol']}")
                     continue
+                
+                # If first run, automatically process CLOSE signals without asking
+                if is_first_run:
+                    logger.info(f"First run: Auto-processing CLOSE signal for {close_signal['symbol']}")
                 
                 logger.info(f"CLOSE signal detected: {close_signal}")
                 
@@ -584,6 +750,7 @@ class TradingBot:
 """
                         self.send_email_notification(f"🔴 Error Closing Position - {close_signal['symbol']}", error_msg)
                         logger.error(f"Error closing position for {close_signal['symbol']}: {close_error}")
+                        self.db.update_signal_status(signal_hash, 'error')
                         close_success = False
                     
                     if close_success:
@@ -593,6 +760,7 @@ class TradingBot:
                             close_signal['profit_percentage']
                         )
                         self.db.mark_signal_processed(signal_hash)
+                        self.db.update_signal_status(signal_hash, 'executed')
                         logger.info(f"Position closed: {close_signal['symbol']} with {close_signal['profit_percentage']}% profit")
                         
                         # Send notification
@@ -611,15 +779,72 @@ class TradingBot:
                 else:
                     logger.info(f"No open position found for {close_signal['symbol']}")
                     self.db.mark_signal_processed(signal_hash)
+                    self.db.update_signal_status(signal_hash, 'no-position')
+        
+        return True  # Continue running
     
     async def run(self):
         """Main loop to run the bot"""
         await self.telegram_client.start(phone=TELEGRAM_CONFIG['phone'])
         logger.info("Bot started successfully")
         
+        # Check if this is the first run of the day
+        is_first_run = self.db.is_first_run_today()
+        
+        if is_first_run:
+            print("\n" + "="*60)
+            print("🚀 FIRST RUN OF THE DAY - INITIAL SETUP MODE")
+            print("="*60)
+            print("\nThe bot will fetch ALL messages from today and let you")
+            print("review each signal individually.")
+            print("\nFor each signal, you can:")
+            print("  - Press 'y' to process and open the position")
+            print("  - Press 'n' to skip (if you already opened it manually)")
+            print("  - Press 'q' to quit and resume later")
+            print("\n" + "="*60 + "\n")
+            
+            # Process all today's messages with interactive review
+            continue_running = await self.process_messages(is_first_run=True)
+            
+            if not continue_running:
+                logger.info("Initial setup interrupted by user. Exiting.")
+                return
+            
+            # Mark first run as completed
+            self.db.mark_run_completed()
+            
+            print("\n" + "="*60)
+            print("✅ INITIAL SETUP COMPLETED")
+            print("="*60)
+            print("\nThe bot will now run in continuous mode.")
+            print("Every 5 minutes, it will:")
+            print("  - Fetch ALL messages from today")
+            print("  - Process only NEW signals automatically")
+            print("  - Skip signals already in database")
+            print("\nPress Ctrl+C to stop the bot.")
+            print("="*60 + "\n")
+        
+        # Continuous mode - check every 5 minutes
         while True:
             try:
-                await self.process_messages()
+                # Check if it's a new day - if so, enter first run mode again
+                if self.db.is_first_run_today():
+                    logger.info("New day detected - entering first run mode")
+                    print("\n" + "="*60)
+                    print("📅 NEW DAY DETECTED - ENTERING INITIAL SETUP MODE")
+                    print("="*60 + "\n")
+                    
+                    continue_running = await self.process_messages(is_first_run=True)
+                    
+                    if not continue_running:
+                        logger.info("Initial setup interrupted by user. Exiting.")
+                        return
+                    
+                    self.db.mark_run_completed()
+                    print("\n✅ Initial setup for new day completed. Continuing in automatic mode.\n")
+                else:
+                    # Normal processing - automatic mode (fetches all today's messages every 5min)
+                    await self.process_messages(is_first_run=False)
             except Exception as e:
                 error_msg = f"""
 🔴 <b>CRITICAL ERROR IN BOT</b>
@@ -634,7 +859,7 @@ The bot will continue running and retry in the next cycle.
                 self.send_email_notification("🔴 Critical Error in Trading Bot", error_msg)
                 logger.error(f"Error in main loop: {e}")
             
-            # Wait for next iteration
+            # Wait for next iteration (5 minutes)
             await asyncio.sleep(TRADING_CONFIG['fetch_interval'])
 
 async def main():
