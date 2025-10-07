@@ -35,6 +35,15 @@ TRADING_CONFIG = {
     'message_lookback': 5  # 5 minutes
 }
 
+NOTIFICATION_CONFIG = {
+    'enabled': True,
+    'chat_id': 'me',  # 'me' for saved messages, or specific chat_id/username
+    'send_logs': True,  # Send log messages
+    'send_errors': True,  # Send error messages
+    'send_debug': True,  # Send debug info
+    'send_signals': True  # Send signal detection notifications
+}
+
 class TradingDatabase:
     def __init__(self, db_name='trading_bot.db'):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
@@ -400,6 +409,21 @@ class TradingBot:
         )
         self.extractor = SignalExtractor()
     
+    async def send_notification(self, message):
+        """Send notification message to Telegram"""
+        if not NOTIFICATION_CONFIG['enabled']:
+            return
+        
+        try:
+            await self.telegram_client.send_message(
+                NOTIFICATION_CONFIG['chat_id'],
+                message,
+                parse_mode='markdown'
+            )
+            logger.info(f"Notification sent: {message[:50]}...")
+        except Exception as e:
+            logger.error(f"Failed to send notification: {e}")
+    
     async def fetch_recent_messages(self):
         """Fetch messages from the last 5 minutes"""
         messages = []
@@ -472,6 +496,23 @@ class TradingBot:
                     )
                     self.db.mark_signal_processed(signal_hash)
                     logger.info(f"Position opened and logged: {result['symbol']}")
+                    
+                    # Send notification
+                    notification = f"""
+🟢 **POSITION OPENED**
+
+**Symbol:** {result['symbol']}
+**Type:** LONG
+**Leverage:** {TRADING_CONFIG['leverage']}x
+**Entry Price:** ${result['entry']:.4f}
+**Stop Loss:** ${result['sl']:.4f}
+**Take Profit:** ${result['tp']:.4f}
+**Quantity:** {result['quantity']:.4f}
+**Risk:** {TRADING_CONFIG['risk_percentage']}%
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                    await self.send_notification(notification)
             
             # Try to extract CLOSE signal
             close_signal = self.extractor.extract_close_signal(text)
@@ -496,6 +537,19 @@ class TradingBot:
                         )
                         self.db.mark_signal_processed(signal_hash)
                         logger.info(f"Position closed: {close_signal['symbol']} with {close_signal['profit_percentage']}% profit")
+                        
+                        # Send notification
+                        profit_emoji = "🟢" if close_signal['profit_percentage'] > 0 else "🔴"
+                        notification = f"""
+{profit_emoji} **POSITION CLOSED**
+
+**Symbol:** {close_signal['symbol']}
+**Profit:** {close_signal['profit_percentage']:+.2f}%
+**Status:** {'✅ WIN' if close_signal['profit_percentage'] > 0 else '❌ LOSS'}
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                        await self.send_notification(notification)
                 else:
                     logger.info(f"No open position found for {close_signal['symbol']}")
                     self.db.mark_signal_processed(signal_hash)
