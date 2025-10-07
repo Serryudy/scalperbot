@@ -1,2 +1,22 @@
+# Log files
 trading_bot.log
-trading_bot.log
+*.log
+
+# Session files
+trading_bot_session.session
+trading_bot_session.session-journal
+*.session
+*.session-journal
+
+# Database files
+trading_bot.db
+*.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+env/
