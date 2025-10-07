@@ -6,6 +6,9 @@ import sqlite3
 from binance.client import Client
 from binance.enums import *
 import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Configure logging
 logging.basicConfig(
@@ -35,12 +38,13 @@ TRADING_CONFIG = {
     'message_lookback': 5  # 5 minutes
 }
 
-NOTIFICATION_CONFIG = {
+EMAIL_CONFIG = {
     'enabled': True,
-    'chat_id': 'me',  # 'me' for saved messages, or specific chat_id/username
-    'send_logs': True,  # Send log messages
-    'send_errors': True,  # Send error messages
-    'send_debug': True,  # Send debug info
+    'to_email': 'somapalagalagedara@gmail.com',
+    'from_email': 'somapalagalagedara@gmail.com',  # Gmail account to send from
+    'smtp_server': 'smtp.gmail.com',
+    'smtp_port': 587,
+    'password': 'gmsq cxug zkhv jtik',  # Add your Gmail app password here (not regular password)
     'send_signals': True  # Send signal detection notifications
 }
 
@@ -409,20 +413,40 @@ class TradingBot:
         )
         self.extractor = SignalExtractor()
     
-    async def send_notification(self, message):
-        """Send notification message to Telegram"""
-        if not NOTIFICATION_CONFIG['enabled']:
+    def send_email_notification(self, subject, message):
+        """Send notification via email"""
+        if not EMAIL_CONFIG['enabled']:
+            return
+        
+        if not EMAIL_CONFIG['password']:
+            logger.warning("Email password not configured. Skipping email notification.")
             return
         
         try:
-            await self.telegram_client.send_message(
-                NOTIFICATION_CONFIG['chat_id'],
-                message,
-                parse_mode='markdown'
-            )
-            logger.info(f"Notification sent: {message[:50]}...")
+            msg = MIMEMultipart('alternative')
+            msg['From'] = EMAIL_CONFIG['from_email']
+            msg['To'] = EMAIL_CONFIG['to_email']
+            msg['Subject'] = subject
+            
+            # Convert HTML-like formatting to plain text
+            text_message = message.replace('<b>', '').replace('</b>', '')
+            
+            # Create both plain text and HTML versions
+            text_part = MIMEText(text_message, 'plain')
+            html_part = MIMEText(message.replace('\n', '<br>'), 'html')
+            
+            msg.attach(text_part)
+            msg.attach(html_part)
+            
+            # Connect to Gmail SMTP server
+            with smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port']) as server:
+                server.starttls()
+                server.login(EMAIL_CONFIG['from_email'], EMAIL_CONFIG['password'])
+                server.send_message(msg)
+            
+            logger.info(f"Email notification sent: {subject}")
         except Exception as e:
-            logger.error(f"Failed to send notification: {e}")
+            logger.error(f"Failed to send email notification: {e}")
     
     async def fetch_recent_messages(self):
         """Fetch messages from the last 5 minutes"""
@@ -477,11 +501,28 @@ class TradingBot:
                 logger.info(f"New LONG signal detected: {long_signal}")
                 
                 # Execute trade
-                result = self.trader.open_long_position(
-                    long_signal,
-                    TRADING_CONFIG['leverage'],
-                    TRADING_CONFIG['risk_percentage']
-                )
+                try:
+                    result = self.trader.open_long_position(
+                        long_signal,
+                        TRADING_CONFIG['leverage'],
+                        TRADING_CONFIG['risk_percentage']
+                    )
+                except Exception as trade_error:
+                    error_msg = f"""
+🔴 <b>ERROR OPENING POSITION</b>
+
+<b>Symbol:</b> {long_signal['symbol']}
+<b>Error:</b> {str(trade_error)}
+<b>Signal Details:</b>
+- Entry: ${long_signal['entry_price']:.4f}
+- Stop Loss: ${long_signal['stop_loss']:.4f}
+- Take Profit: ${long_signal['take_profit']:.4f}
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                    self.send_email_notification(f"🔴 Error Opening Position - {long_signal['symbol']}", error_msg)
+                    logger.error(f"Error opening position for {long_signal['symbol']}: {trade_error}")
+                    result = None
                 
                 if result:
                     # Save to database
@@ -499,20 +540,20 @@ class TradingBot:
                     
                     # Send notification
                     notification = f"""
-🟢 **POSITION OPENED**
+🟢 <b>POSITION OPENED</b>
 
-**Symbol:** {result['symbol']}
-**Type:** LONG
-**Leverage:** {TRADING_CONFIG['leverage']}x
-**Entry Price:** ${result['entry']:.4f}
-**Stop Loss:** ${result['sl']:.4f}
-**Take Profit:** ${result['tp']:.4f}
-**Quantity:** {result['quantity']:.4f}
-**Risk:** {TRADING_CONFIG['risk_percentage']}%
+<b>Symbol:</b> {result['symbol']}
+<b>Type:</b> LONG
+<b>Leverage:</b> {TRADING_CONFIG['leverage']}x
+<b>Entry Price:</b> ${result['entry']:.4f}
+<b>Stop Loss:</b> ${result['sl']:.4f}
+<b>Take Profit:</b> ${result['tp']:.4f}
+<b>Quantity:</b> {result['quantity']:.4f}
+<b>Risk:</b> {TRADING_CONFIG['risk_percentage']}%
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 """
-                    await self.send_notification(notification)
+                    self.send_email_notification(f"🟢 Position Opened - {result['symbol']}", notification)
             
             # Try to extract CLOSE signal
             close_signal = self.extractor.extract_close_signal(text)
@@ -529,7 +570,23 @@ class TradingBot:
                 # Check if position exists in database
                 if self.db.is_position_open(close_signal['symbol']):
                     # Close position on Binance
-                    if self.trader.close_position(close_signal['symbol']):
+                    try:
+                        close_success = self.trader.close_position(close_signal['symbol'])
+                    except Exception as close_error:
+                        error_msg = f"""
+🔴 <b>ERROR CLOSING POSITION</b>
+
+<b>Symbol:</b> {close_signal['symbol']}
+<b>Error:</b> {str(close_error)}
+<b>Expected Profit:</b> {close_signal['profit_percentage']:+.2f}%
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                        self.send_email_notification(f"🔴 Error Closing Position - {close_signal['symbol']}", error_msg)
+                        logger.error(f"Error closing position for {close_signal['symbol']}: {close_error}")
+                        close_success = False
+                    
+                    if close_success:
                         # Update database
                         self.db.close_position(
                             close_signal['symbol'],
@@ -540,16 +597,17 @@ class TradingBot:
                         
                         # Send notification
                         profit_emoji = "🟢" if close_signal['profit_percentage'] > 0 else "🔴"
+                        status = 'WIN' if close_signal['profit_percentage'] > 0 else 'LOSS'
                         notification = f"""
-{profit_emoji} **POSITION CLOSED**
+{profit_emoji} <b>POSITION CLOSED</b>
 
-**Symbol:** {close_signal['symbol']}
-**Profit:** {close_signal['profit_percentage']:+.2f}%
-**Status:** {'✅ WIN' if close_signal['profit_percentage'] > 0 else '❌ LOSS'}
+<b>Symbol:</b> {close_signal['symbol']}
+<b>Profit:</b> {close_signal['profit_percentage']:+.2f}%
+<b>Status:</b> {'✅ WIN' if close_signal['profit_percentage'] > 0 else '❌ LOSS'}
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 """
-                        await self.send_notification(notification)
+                        self.send_email_notification(f"{profit_emoji} Position Closed - {close_signal['symbol']} ({status})", notification)
                 else:
                     logger.info(f"No open position found for {close_signal['symbol']}")
                     self.db.mark_signal_processed(signal_hash)
@@ -563,6 +621,17 @@ class TradingBot:
             try:
                 await self.process_messages()
             except Exception as e:
+                error_msg = f"""
+🔴 <b>CRITICAL ERROR IN BOT</b>
+
+<b>Error Type:</b> {type(e).__name__}
+<b>Error Message:</b> {str(e)}
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+The bot will continue running and retry in the next cycle.
+"""
+                self.send_email_notification("🔴 Critical Error in Trading Bot", error_msg)
                 logger.error(f"Error in main loop: {e}")
             
             # Wait for next iteration
