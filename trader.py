@@ -34,7 +34,7 @@ BINANCE_CONFIG = {
 TRADING_CONFIG = {
     'leverage': 10,
     'risk_percentage': 10,  # 10% of account
-    'fetch_interval': 60,  # 1 minute
+    'fetch_interval': 300,  # 5 minutes (changed from 60 seconds)
     'message_lookback': 5  # 5 minutes
 }
 
@@ -242,8 +242,8 @@ class SignalExtractor:
         symbol = symbol_match.group(1)
         
         # Extract entry price (handle multiple formats)
-        # Format: - Entry: 0.8571 or - Entry: 1.836 (30% VOL)
-        entry_pattern = r'-\s*ENTRY(?:\s*LIMIT)?[:\s]*(\d+\.?\d*)'
+        # Format: - Entry: 0.8571 or - Entry: 1.836 (30% VOL) or - Entry: 5.749 ( 30% VOL)
+        entry_pattern = r'-\s*ENTRY(?:\s*LIMIT)?[:\s]*(\d+(?:\.\d+)?)'
         entry_match = re.search(entry_pattern, text_upper)
         if not entry_match:
             return None
@@ -252,7 +252,7 @@ class SignalExtractor:
         
         # Extract stop loss
         # Format: - SL: 0.8030
-        sl_pattern = r'-\s*SL[:\s]*(\d+\.?\d*)'
+        sl_pattern = r'-\s*SL[:\s]*(\d+(?:\.\d+)?)'
         sl_match = re.search(sl_pattern, text_upper)
         if not sl_match:
             return None
@@ -261,7 +261,7 @@ class SignalExtractor:
         
         # Extract take profit
         # Format: 🎯 TP: 1.5278
-        tp_pattern = r'(?:🎯|TARGET)?\s*TP[:\s]*(\d+\.?\d*)'
+        tp_pattern = r'(?:🎯|TARGET)?\s*TP[:\s]*(\d+(?:\.\d+)?)'
         tp_match = re.search(tp_pattern, text_upper)
         if not tp_match:
             return None
@@ -281,30 +281,24 @@ class SignalExtractor:
         """Extract CLOSE signal details from message"""
         text_upper = text.upper()
         
-        # Check if it contains profit update keywords
-        # Patterns: "API3 + 27.1% profit", "MUBARAK + 357% profit, close"
-        if not ('+' in text and '%' in text and 'PROFIT' in text_upper):
+        # Only treat as CLOSE signal if it explicitly mentions "close" in the message
+        if 'CLOSE' not in text_upper:
             return None
         
-        # Extract symbol - pattern: SYMBOL + percentage% profit
-        # Look for word before the + sign
-        symbol_pattern = r'([A-Z0-9]{2,15})\s*\+'
+        # Extract symbol - pattern: SYMBOL + percentage% profit OR just SYMBOL before "close"
+        # First try: SYMBOL + percentage% profit
+        symbol_pattern = r'([A-Z0-9]{2,15})\s*(?:\+|\s+EVERYONE\s+CAN\s+CLOSE)'
         symbol_match = re.search(symbol_pattern, text_upper)
         if not symbol_match:
             return None
         
         symbol = symbol_match.group(1)
         
-        # Extract profit percentage
-        profit_pattern = r'\+\s*(\d+\.?\d*)\s*%'
-        profit_match = re.search(profit_pattern, text)
+        # Extract profit percentage if present
+        profit_pattern = r'(\d+(?:\.\d+)?)\s*%\s*PROFIT'
+        profit_match = re.search(profit_pattern, text_upper)
         
         profit_pct = float(profit_match.group(1)) if profit_match else 0
-        
-        # Only treat as CLOSE signal if it explicitly mentions "close" in the message
-        if 'CLOSE' not in text_upper:
-            # This is just a profit update, not a close signal
-            return None
         
         return {
             'type': 'CLOSE',
@@ -607,11 +601,14 @@ class TradingBot:
     async def process_messages(self, is_first_run=False):
         """Process messages and execute trades"""
         messages = await self.fetch_recent_messages()
-        logger.info(f"Fetched {len(messages)} messages from today")
+        logger.info(f"Fetched {len(messages)} messages from today at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
         
         if is_first_run:
             print(f"\n🔍 INITIAL SETUP MODE - Found {len(messages)} messages from today")
             print("You will be asked to review each signal individually.\n")
+        
+        signals_processed = 0
+        signals_skipped = 0
         
         for msg in reversed(messages):  # Process oldest first
             text = msg['text']
@@ -620,6 +617,7 @@ class TradingBot:
             # Try to extract LONG signal
             long_signal = self.extractor.extract_long_signal(text)
             if long_signal:
+                logger.info(f"LONG signal detected for {long_signal['symbol']} from message at {msg_date}")
                 signal_hash = self.generate_signal_hash(long_signal, msg_date)
                 
                 # Save detected signal to database
@@ -781,6 +779,7 @@ class TradingBot:
                     self.db.mark_signal_processed(signal_hash)
                     self.db.update_signal_status(signal_hash, 'no-position')
         
+        logger.info(f"Message processing completed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
         return True  # Continue running
     
     async def run(self):
@@ -827,6 +826,8 @@ class TradingBot:
         # Continuous mode - check every 5 minutes
         while True:
             try:
+                logger.info(f"Starting message check cycle at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                
                 # Check if it's a new day - if so, enter first run mode again
                 if self.db.is_first_run_today():
                     logger.info("New day detected - entering first run mode")
@@ -860,6 +861,7 @@ The bot will continue running and retry in the next cycle.
                 logger.error(f"Error in main loop: {e}")
             
             # Wait for next iteration (5 minutes)
+            logger.info(f"Sleeping for {TRADING_CONFIG['fetch_interval']} seconds until next check...")
             await asyncio.sleep(TRADING_CONFIG['fetch_interval'])
 
 async def main():
