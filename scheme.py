@@ -182,7 +182,7 @@ class BinanceFuturesBot:
         balance = self.fetch_account_balance()
         
         # Use 95% of available balance (leave 5% as buffer for fees and margin requirements)
-        usable_capital = balance * (95.0 / 100)
+        usable_capital = balance * (25.0 / 100)
         
         # Get current price
         ticker = self.client.futures_symbol_ticker(symbol=self.symbol)
