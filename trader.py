@@ -7,6 +7,9 @@ import json
 from binance.client import Client
 from binance.enums import *
 import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Configure logging
 logging.basicConfig(
@@ -31,20 +34,24 @@ BINANCE_CONFIG = {
 
 TRADING_CONFIG = {
     'leverage': 10,
-    'risk_percentage': 10,  # 10% of account
+    'risk_percentage': 10,
     'fetch_interval': 300,  # 5 minutes
-    'lookback_hours': 24
+    'lookback_hours': 24,
+    'max_open_positions': 5,  # Maximum 5 positions at once
+    'max_total_risk': 50,  # Maximum 50% of account at risk
+    'trailing_stop_enabled': True,
+    'trailing_stop_activation': 20,  # Activate at 20% profit
+    'trailing_stop_distance': 10,  # Trail 10% below peak
+    'breakeven_at_profit': 15,  # Move SL to breakeven at 15% profit
+    'position_sync_interval': 60  # Sync with Binance every 60 seconds
 }
 
-# DeepSeek API Configuration (Free tier available)
-# Alternative: Use local Ollama or Hugging Face models
 DEEPSEEK_CONFIG = {
-    'api_key': 'sk-abaae5d245c64f899a1302208cc671b1',  # Get from https://platform.deepseek.com
+    'api_key': 'sk-abaae5d245c64f899a1302208cc671b1',
     'base_url': 'https://api.deepseek.com/v1',
     'model': 'deepseek-chat'
 }
 
-# Email notifications
 EMAIL_CONFIG = {
     'enabled': True,
     'to_email': 'somapalagalagedara@gmail.com',
@@ -55,14 +62,13 @@ EMAIL_CONFIG = {
 }
 
 class MessageDatabase:
-    def __init__(self, db_name='ai_trading_bot.db'):
+    def __init__(self, db_name='improved_trading_bot.db'):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.create_tables()
     
     def create_tables(self):
         cursor = self.conn.cursor()
         
-        # Messages table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,43 +82,42 @@ class MessageDatabase:
             )
         ''')
         
-        # Positions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
                 entry_price REAL,
-                entry_limit_price REAL,
                 stop_loss REAL,
                 take_profit REAL,
+                current_stop_loss REAL,
+                highest_price REAL,
                 quantity REAL,
                 leverage INTEGER,
                 opened_at TIMESTAMP,
                 closed_at TIMESTAMP,
                 status TEXT NOT NULL,
                 profit_percentage REAL,
+                close_reason TEXT,
                 source_message_id INTEGER,
                 binance_order_id TEXT,
-                position_details TEXT
+                last_synced_at TIMESTAMP
             )
         ''')
         
-        # Position updates table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS position_updates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 position_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
                 update_type TEXT NOT NULL,
-                update_details TEXT NOT NULL,
+                old_value REAL,
+                new_value REAL,
                 profit_percentage REAL,
-                action_taken TEXT,
+                note TEXT,
                 updated_at TIMESTAMP NOT NULL,
                 FOREIGN KEY (position_id) REFERENCES positions (id)
             )
         ''')
         
-        # Trading actions log
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trading_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +133,6 @@ class MessageDatabase:
         self.conn.commit()
     
     def save_message(self, message_id, text, message_date):
-        """Save a message to database"""
         cursor = self.conn.cursor()
         try:
             cursor.execute('''
@@ -142,7 +146,6 @@ class MessageDatabase:
             return False
     
     def mark_message_processed(self, message_id, message_type, ai_analysis):
-        """Mark message as processed with AI analysis"""
         cursor = self.conn.cursor()
         cursor.execute('''
             UPDATE messages 
@@ -152,7 +155,6 @@ class MessageDatabase:
         self.conn.commit()
     
     def get_unprocessed_messages(self):
-        """Get all unprocessed messages"""
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT message_id, message_text, message_date
@@ -162,60 +164,94 @@ class MessageDatabase:
         ''')
         return cursor.fetchall()
     
-    def save_position(self, symbol, entry, entry_limit, sl, tp, qty, leverage, message_id, order_id=None):
-        """Save a new position"""
+    def save_position(self, symbol, entry, sl, tp, qty, leverage, message_id, order_id=None):
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT INTO positions 
-            (symbol, entry_price, entry_limit_price, stop_loss, take_profit, 
-             quantity, leverage, opened_at, status, source_message_id, binance_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-        ''', (symbol, entry, entry_limit, sl, tp, qty, leverage, 
-              datetime.now(timezone.utc), message_id, order_id))
+            (symbol, entry_price, stop_loss, take_profit, current_stop_loss, highest_price,
+             quantity, leverage, opened_at, status, source_message_id, binance_order_id, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+        ''', (symbol, entry, sl, tp, sl, entry, qty, leverage,
+              datetime.now(timezone.utc), message_id, order_id, datetime.now(timezone.utc)))
         self.conn.commit()
         return cursor.lastrowid
     
     def get_open_position(self, symbol):
-        """Get open position for a symbol"""
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT * FROM positions 
             WHERE symbol = ? AND status = 'open'
             ORDER BY opened_at DESC LIMIT 1
         ''', (symbol,))
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        if row:
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+        return None
     
-    def update_position_status(self, position_id, status, profit_pct=None):
-        """Update position status"""
+    def get_all_open_positions(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT * FROM positions 
+            WHERE status = 'open'
+            ORDER BY opened_at DESC
+        ''')
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    
+    def count_open_positions(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM positions WHERE status = 'open'")
+        return cursor.fetchone()[0]
+    
+    def update_position_status(self, position_id, status, profit_pct=None, close_reason=None):
         cursor = self.conn.cursor()
         if profit_pct is not None:
             cursor.execute('''
                 UPDATE positions 
-                SET status = ?, profit_percentage = ?, closed_at = ?
+                SET status = ?, profit_percentage = ?, closed_at = ?, close_reason = ?
                 WHERE id = ?
-            ''', (status, profit_pct, datetime.now(timezone.utc), position_id))
+            ''', (status, profit_pct, datetime.now(timezone.utc), close_reason, position_id))
         else:
             cursor.execute('''
                 UPDATE positions 
-                SET status = ?
+                SET status = ?, close_reason = ?
                 WHERE id = ?
-            ''', (status, position_id))
+            ''', (status, close_reason, position_id))
         self.conn.commit()
     
-    def save_position_update(self, position_id, message_id, update_type, details, profit_pct, action_taken):
-        """Save a position update"""
+    def update_position_stop_loss(self, position_id, new_sl, reason):
         cursor = self.conn.cursor()
+        # Get old SL
+        cursor.execute('SELECT current_stop_loss FROM positions WHERE id = ?', (position_id,))
+        old_sl = cursor.fetchone()[0]
+        
+        # Update SL
+        cursor.execute('''
+            UPDATE positions 
+            SET current_stop_loss = ?
+            WHERE id = ?
+        ''', (new_sl, position_id))
+        
+        # Log update
         cursor.execute('''
             INSERT INTO position_updates 
-            (position_id, message_id, update_type, update_details, 
-             profit_percentage, action_taken, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (position_id, message_id, update_type, details, 
-              profit_pct, action_taken, datetime.now(timezone.utc)))
+            (position_id, update_type, old_value, new_value, note, updated_at)
+            VALUES (?, 'STOP_LOSS_MODIFIED', ?, ?, ?, ?)
+        ''', (position_id, old_sl, new_sl, reason, datetime.now(timezone.utc)))
+        
+        self.conn.commit()
+    
+    def update_position_highest_price(self, position_id, price):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE positions 
+            SET highest_price = ?, last_synced_at = ?
+            WHERE id = ?
+        ''', (price, datetime.now(timezone.utc), position_id))
         self.conn.commit()
     
     def log_trading_action(self, action_type, symbol, details, success, error_msg=None):
-        """Log a trading action"""
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT INTO trading_actions 
@@ -225,17 +261,13 @@ class MessageDatabase:
         self.conn.commit()
 
 class AISignalExtractor:
-    """Uses DeepSeek AI to extract and analyze trading signals"""
-    
     def __init__(self, api_key, base_url, model):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
     
     def analyze_message(self, message_text):
-        """Analyze message using AI to extract trading signals"""
-        
-        system_prompt = """You are a cryptocurrency trading signal analyzer. Your job is to analyze Telegram messages and extract trading signals or position updates.
+        system_prompt = """You are a cryptocurrency trading signal analyzer. Analyze Telegram messages and extract trading signals or position updates.
 
 Output MUST be valid JSON with one of these structures:
 
@@ -272,13 +304,12 @@ For NON-TRADING messages:
 }
 
 Rules:
-1. Symbols should be uppercase without $ sign (e.g., "ZORA" not "$ZORA")
-2. Always append "USDT" to symbols (e.g., "ZORAUSDT")
-3. Extract profit percentages from messages like "SYMBOL + 56.1% profit"
-4. Messages mentioning "cancel", "cancelled", or "missed" are UPDATE type with action "CANCELLED"
-5. Messages with just profit updates are UPDATE type with action "INFO"
-6. Only return NEW_POSITION if message contains entry, SL, or TP prices
-7. Return valid JSON only, no markdown or extra text"""
+1. Symbols should be uppercase without $ sign, append USDT (e.g., "ZORAUSDT")
+2. Extract profit percentages from "SYMBOL + 56.1% profit" patterns
+3. Messages with "cancel", "cancelled", or "missed" are UPDATE with action "CANCELLED"
+4. Just profit updates are UPDATE with action "INFO"
+5. Only return NEW_POSITION if message contains entry, SL, or TP prices
+6. Return valid JSON only, no markdown"""
 
         user_prompt = f"Analyze this trading message:\n\n{message_text}"
         
@@ -303,10 +334,9 @@ Rules:
             
             if response.status_code == 200:
                 result = response.json()
-                content = result['choices'][0]['message']['content']
+                content = result['choices'][0]['message']['content'].strip()
                 
-                # Clean up response (remove markdown if present)
-                content = content.strip()
+                # Clean markdown
                 if content.startswith('```json'):
                     content = content[7:]
                 if content.startswith('```'):
@@ -315,11 +345,9 @@ Rules:
                     content = content[:-3]
                 content = content.strip()
                 
-                # Parse JSON
-                analysis = json.loads(content)
-                return analysis
+                return json.loads(content)
             else:
-                logger.error(f"DeepSeek API error: {response.status_code} - {response.text}")
+                logger.error(f"DeepSeek API error: {response.status_code}")
                 return {"type": "ERROR", "reason": f"API error: {response.status_code}"}
                 
         except Exception as e:
@@ -331,7 +359,6 @@ class BinanceTrader:
         self.client = Client(api_key, api_secret)
     
     def get_account_balance(self):
-        """Get USDT balance for futures account"""
         try:
             balance = self.client.futures_account_balance()
             for b in balance:
@@ -341,8 +368,34 @@ class BinanceTrader:
             logger.error(f"Error getting balance: {e}")
         return 0
     
+    def get_current_price(self, symbol):
+        """Get current market price"""
+        try:
+            ticker = self.client.futures_symbol_ticker(symbol=symbol)
+            return float(ticker['price'])
+        except Exception as e:
+            logger.error(f"Error getting price for {symbol}: {e}")
+            return None
+    
+    def get_position_info(self, symbol):
+        """Get current position information from Binance"""
+        try:
+            positions = self.client.futures_position_information(symbol=symbol)
+            for pos in positions:
+                if pos['symbol'] == symbol:
+                    return {
+                        'symbol': symbol,
+                        'position_amt': float(pos['positionAmt']),
+                        'entry_price': float(pos['entryPrice']),
+                        'unrealized_pnl': float(pos['unRealizedProfit']),
+                        'leverage': int(pos['leverage']),
+                        'is_open': float(pos['positionAmt']) != 0
+                    }
+        except Exception as e:
+            logger.error(f"Error getting position info: {e}")
+        return None
+    
     def set_leverage(self, symbol, leverage):
-        """Set leverage for symbol"""
         try:
             self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
             logger.info(f"Set {leverage}x leverage for {symbol}")
@@ -352,7 +405,6 @@ class BinanceTrader:
             return False
     
     def calculate_position_size(self, balance, risk_pct, entry, sl):
-        """Calculate position size based on risk"""
         risk_amount = balance * (risk_pct / 100)
         risk_per_unit = abs(entry - sl)
         if risk_per_unit == 0:
@@ -361,7 +413,6 @@ class BinanceTrader:
         return quantity
     
     def get_symbol_precision(self, symbol):
-        """Get quantity and price precision for symbol"""
         try:
             info = self.client.futures_exchange_info()
             for s in info['symbols']:
@@ -380,23 +431,51 @@ class BinanceTrader:
             logger.error(f"Error getting precision: {e}")
         return 3, 2
     
+    def modify_stop_loss(self, symbol, new_sl):
+        """Modify stop loss for existing position"""
+        try:
+            # Get current position
+            position = self.get_position_info(symbol)
+            if not position or not position['is_open']:
+                logger.warning(f"No open position for {symbol}")
+                return False
+            
+            qty = abs(position['position_amt'])
+            qty_precision, price_precision = self.get_symbol_precision(symbol)
+            
+            # Cancel existing stop loss orders
+            self.client.futures_cancel_all_open_orders(symbol=symbol)
+            
+            # Set new stop loss
+            sl_order = self.client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice=round(new_sl, price_precision),
+                quantity=round(qty, qty_precision),
+                closePosition=True
+            )
+            
+            logger.info(f"✅ Modified SL for {symbol} to {new_sl}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error modifying SL: {e}")
+            return False
+    
     def open_long_position(self, signal, leverage, risk_pct):
-        """Open a LONG position"""
         try:
             symbol = signal['symbol']
             entry = signal['entry_price']
             sl = signal['stop_loss']
             tp = signal.get('take_profit')
             
-            # Set leverage
             if not self.set_leverage(symbol, leverage):
                 return None
             
-            # Get balance
             balance = self.get_account_balance()
             logger.info(f"Account balance: {balance} USDT")
             
-            # Calculate position size
             qty = self.calculate_position_size(balance, risk_pct, entry, sl)
             qty_precision, price_precision = self.get_symbol_precision(symbol)
             qty = round(qty, qty_precision)
@@ -460,7 +539,6 @@ class BinanceTrader:
             return None
     
     def close_position(self, symbol, partial_pct=None):
-        """Close a position (full or partial)"""
         try:
             positions = self.client.futures_position_information(symbol=symbol)
             
@@ -474,10 +552,8 @@ class BinanceTrader:
                     else:
                         qty = total_qty
                         logger.info(f"Closing full position {symbol}: {qty} units")
-                        # Cancel all open orders
                         self.client.futures_cancel_all_open_orders(symbol=symbol)
                     
-                    # Close with market order
                     order = self.client.futures_create_order(
                         symbol=symbol,
                         side=SIDE_SELL,
@@ -494,18 +570,11 @@ class BinanceTrader:
         except Exception as e:
             logger.error(f"❌ Error closing position: {e}")
             return False
-    
-    def modify_position_entry(self, symbol, new_entry):
-        """Modify position entry (note: can't modify filled orders, this is informational)"""
-        logger.info(f"ℹ️ Entry modification noted for {symbol}: {new_entry}")
-        # In real trading, you would need to close and reopen at new price
-        # For now, just log it
-        return True
 
-class AITradingBot:
+class ImprovedAITradingBot:
     def __init__(self):
         self.telegram_client = TelegramClient(
-            'my_session',
+            'my_session.session',
             TELEGRAM_CONFIG['api_id'],
             TELEGRAM_CONFIG['api_hash']
         )
@@ -520,8 +589,180 @@ class AITradingBot:
             DEEPSEEK_CONFIG['model']
         )
     
+    def send_email_notification(self, subject, message):
+        if not EMAIL_CONFIG['enabled']:
+            return
+        
+        try:
+            msg = MIMEMultipart('alternative')
+            msg['From'] = EMAIL_CONFIG['from_email']
+            msg['To'] = EMAIL_CONFIG['to_email']
+            msg['Subject'] = subject
+            
+            text_message = message.replace('<b>', '').replace('</b>', '')
+            text_part = MIMEText(text_message, 'plain')
+            html_part = MIMEText(message.replace('\n', '<br>'), 'html')
+            
+            msg.attach(text_part)
+            msg.attach(html_part)
+            
+            with smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port']) as server:
+                server.starttls()
+                server.login(EMAIL_CONFIG['from_email'], EMAIL_CONFIG['password'])
+                server.send_message(msg)
+            
+            logger.info(f"📧 Email sent: {subject}")
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+    
+    def can_open_new_position(self):
+        """Check if we can open a new position based on risk limits"""
+        open_count = self.db.count_open_positions()
+        total_risk = open_count * TRADING_CONFIG['risk_percentage']
+        
+        if open_count >= TRADING_CONFIG['max_open_positions']:
+            logger.warning(f"⚠️ Max positions reached: {open_count}/{TRADING_CONFIG['max_open_positions']}")
+            return False
+        
+        if total_risk >= TRADING_CONFIG['max_total_risk']:
+            logger.warning(f"⚠️ Max total risk reached: {total_risk}%/{TRADING_CONFIG['max_total_risk']}%")
+            return False
+        
+        return True
+    
+    async def sync_positions_with_binance(self):
+        """CRITICAL: Sync database positions with actual Binance positions"""
+        open_positions = self.db.get_all_open_positions()
+        
+        for position in open_positions:
+            try:
+                symbol = position['symbol']
+                
+                # Get actual position from Binance
+                binance_position = self.trader.get_position_info(symbol)
+                
+                if not binance_position:
+                    continue
+                
+                # Check if position is actually closed on Binance
+                if not binance_position['is_open']:
+                    # Position closed on Binance but still open in DB
+                    entry = position['entry_price']
+                    final_price = binance_position['entry_price'] if binance_position['entry_price'] != 0 else entry
+                    profit_pct = ((final_price - entry) / entry) * 100 if entry != 0 else 0
+                    
+                    self.db.update_position_status(
+                        position['id'],
+                        'closed',
+                        profit_pct,
+                        'Closed on Binance (SL/TP hit)'
+                    )
+                    
+                    logger.info(f"🔄 Synced: {symbol} was closed on Binance (Profit: {profit_pct:.2f}%)")
+                    
+                    # Send notification
+                    profit_emoji = "🟢" if profit_pct > 0 else "🔴"
+                    notification = f"""
+{profit_emoji} <b>POSITION AUTO-CLOSED (SL/TP)</b>
+
+<b>Symbol:</b> {symbol}
+<b>Profit:</b> {profit_pct:+.2f}%
+<b>Reason:</b> Stop Loss or Take Profit hit on Binance
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                    self.send_email_notification(
+                        f"{profit_emoji} Auto-Closed - {symbol}",
+                        notification
+                    )
+                    
+                    self.db.log_trading_action(
+                        'POSITION_SYNC',
+                        symbol,
+                        f"Synced closed position: {profit_pct:.2f}%",
+                        True
+                    )
+                
+            except Exception as e:
+                logger.error(f"Error syncing position {position['symbol']}: {e}")
+    
+    async def manage_trailing_stops(self):
+        """Manage trailing stop losses for open positions"""
+        if not TRADING_CONFIG['trailing_stop_enabled']:
+            return
+        
+        open_positions = self.db.get_all_open_positions()
+        
+        for position in open_positions:
+            try:
+                symbol = position['symbol']
+                entry = position['entry_price']
+                current_sl = position['current_stop_loss']
+                highest_price = position['highest_price']
+                
+                # Get current price
+                current_price = self.trader.get_current_price(symbol)
+                if not current_price:
+                    continue
+                
+                # Update highest price if current is higher
+                if current_price > highest_price:
+                    self.db.update_position_highest_price(position['id'], current_price)
+                    highest_price = current_price
+                
+                # Calculate profit percentage
+                profit_pct = ((current_price - entry) / entry) * 100
+                
+                # Move SL to breakeven at configured profit level
+                if (profit_pct >= TRADING_CONFIG['breakeven_at_profit'] and 
+                    current_sl < entry):
+                    
+                    logger.info(f"📈 {symbol}: Moving SL to breakeven (Profit: {profit_pct:.2f}%)")
+                    
+                    if self.trader.modify_stop_loss(symbol, entry):
+                        self.db.update_position_stop_loss(
+                            position['id'],
+                            entry,
+                            f"Moved to breakeven at {profit_pct:.2f}% profit"
+                        )
+                        
+                        notification = f"""
+🛡️ <b>STOP LOSS MOVED TO BREAKEVEN</b>
+
+<b>Symbol:</b> {symbol}
+<b>Current Profit:</b> {profit_pct:+.2f}%
+<b>New SL:</b> ${entry:.4f} (Breakeven)
+<b>Risk Protected:</b> Position now risk-free!
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                        self.send_email_notification(
+                            f"🛡️ SL→Breakeven - {symbol}",
+                            notification
+                        )
+                
+                # Activate trailing stop
+                elif profit_pct >= TRADING_CONFIG['trailing_stop_activation']:
+                    trail_distance = TRADING_CONFIG['trailing_stop_distance']
+                    new_sl = highest_price * (1 - trail_distance / 100)
+                    
+                    # Only update if new SL is higher than current
+                    if new_sl > current_sl:
+                        logger.info(f"📈 {symbol}: Trailing SL from ${current_sl:.4f} to ${new_sl:.4f}")
+                        
+                        if self.trader.modify_stop_loss(symbol, new_sl):
+                            self.db.update_position_stop_loss(
+                                position['id'],
+                                new_sl,
+                                f"Trailing stop: {trail_distance}% from peak ${highest_price:.4f}"
+                            )
+                            
+                            logger.info(f"✅ Trailing SL updated for {symbol}")
+                
+            except Exception as e:
+                logger.error(f"Error managing trailing stop for {position['symbol']}: {e}")
+    
     async def fetch_messages(self):
-        """Fetch messages from the last 24 hours"""
         messages = []
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=TRADING_CONFIG['lookback_hours'])
         
@@ -534,7 +775,6 @@ class AITradingBot:
                 break
             
             if message.text:
-                # Save to database if new
                 self.db.save_message(message.id, message.text, message.date)
                 messages.append({
                     'id': message.id,
@@ -545,7 +785,6 @@ class AITradingBot:
         return messages
     
     async def process_new_position(self, signal, message_id):
-        """Process a new position signal"""
         symbol = signal['signal']['symbol']
         
         logger.info(f"🆕 NEW POSITION SIGNAL: {symbol}")
@@ -560,7 +799,13 @@ class AITradingBot:
             self.db.log_trading_action('SKIP', symbol, 'Position already open', False)
             return
         
-        # Open position on Binance
+        # Check risk limits
+        if not self.can_open_new_position():
+            logger.warning(f"⚠️ Cannot open {symbol}: Risk limits reached")
+            self.db.log_trading_action('SKIP', symbol, 'Risk limits reached', False)
+            return
+        
+        # Open position
         result = self.trader.open_long_position(
             signal['signal'],
             TRADING_CONFIG['leverage'],
@@ -568,11 +813,9 @@ class AITradingBot:
         )
         
         if result:
-            # Save to database
             self.db.save_position(
                 symbol=result['symbol'],
                 entry=result['entry'],
-                entry_limit=signal['signal'].get('entry_limit'),
                 sl=result['sl'],
                 tp=result['tp'],
                 qty=result['quantity'],
@@ -588,6 +831,22 @@ class AITradingBot:
                 True
             )
             
+            notification = f"""
+🟢 <b>POSITION OPENED BY AI</b>
+
+<b>Symbol:</b> {symbol}
+<b>Type:</b> LONG
+<b>Leverage:</b> {TRADING_CONFIG['leverage']}x
+<b>Entry Price:</b> ${result['entry']:.4f}
+<b>Stop Loss:</b> ${result['sl']:.4f}
+<b>Take Profit:</b> ${result.get('tp', 'N/A')}
+<b>Quantity:</b> {result['quantity']:.4f}
+<b>Order ID:</b> {result['order_id']}
+<b>Risk:</b> {TRADING_CONFIG['risk_percentage']}%
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+            self.send_email_notification(f"🟢 AI Opened Position - {symbol}", notification)
             logger.info(f"✅ Position opened successfully: {symbol}")
         else:
             self.db.log_trading_action(
@@ -600,7 +859,6 @@ class AITradingBot:
             logger.error(f"❌ Failed to open position: {symbol}")
     
     async def process_position_update(self, update_info, message_id):
-        """Process a position update"""
         symbol = update_info['update']['symbol']
         action = update_info['update']['action']
         profit_pct = update_info['update'].get('profit_percentage')
@@ -609,7 +867,6 @@ class AITradingBot:
         logger.info(f"   Action: {action}")
         logger.info(f"   Profit: {profit_pct}%" if profit_pct else "   Profit: N/A")
         
-        # Get position from database
         position = self.db.get_open_position(symbol)
         
         if not position and action not in ['CANCELLED', 'INFO']:
@@ -617,69 +874,51 @@ class AITradingBot:
             self.db.log_trading_action('UPDATE_POSITION', symbol, 'No position found', False)
             return
         
-        # Handle different actions
         if action == 'CLOSE_FULL':
             success = self.trader.close_position(symbol)
             if success and position:
-                self.db.update_position_status(position[0], 'closed', profit_pct)
-                self.db.save_position_update(
-                    position[0], message_id, 'CLOSE_FULL',
-                    json.dumps(update_info['update']), profit_pct, 'Position closed'
-                )
+                self.db.update_position_status(position['id'], 'closed', profit_pct, 'Closed by AI signal')
                 self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {profit_pct}%", True)
+                
+                profit_emoji = "🟢" if profit_pct > 0 else "🔴"
+                status = 'WIN' if profit_pct > 0 else 'LOSS'
+                notification = f"""
+{profit_emoji} <b>POSITION CLOSED BY AI</b>
+
+<b>Symbol:</b> {symbol}
+<b>Profit:</b> {profit_pct:+.2f}%
+<b>Status:</b> {'✅ WIN' if profit_pct > 0 else '❌ LOSS'}
+<b>Action:</b> Full Close
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                self.send_email_notification(f"{profit_emoji} AI Closed Position - {symbol} ({status})", notification)
                 logger.info(f"✅ Position closed: {symbol} with {profit_pct}% profit")
         
         elif action == 'CLOSE_PARTIAL':
             partial_pct = update_info['update'].get('partial_close_pct', 50)
             success = self.trader.close_position(symbol, partial_pct)
             if success and position:
-                self.db.save_position_update(
-                    position[0], message_id, 'CLOSE_PARTIAL',
-                    json.dumps(update_info['update']), profit_pct, f'Closed {partial_pct}%'
-                )
                 self.db.log_trading_action('CLOSE_PARTIAL', symbol, f"Closed {partial_pct}%", True)
                 logger.info(f"✅ Partial close: {symbol} - {partial_pct}%")
         
-        elif action == 'MODIFY_ENTRY':
-            new_entry = update_info['update'].get('new_entry')
-            if new_entry and position:
-                self.db.save_position_update(
-                    position[0], message_id, 'MODIFY_ENTRY',
-                    json.dumps(update_info['update']), None, f'Entry modified to {new_entry}'
-                )
-                self.db.log_trading_action('MODIFY_ENTRY', symbol, f"New entry: {new_entry}", True)
-                logger.info(f"ℹ️ Entry modified for {symbol}: {new_entry}")
-        
         elif action == 'CANCELLED':
             if position:
-                # Close any open position
                 self.trader.close_position(symbol)
-                self.db.update_position_status(position[0], 'cancelled', 0)
-                self.db.save_position_update(
-                    position[0], message_id, 'CANCELLED',
-                    json.dumps(update_info['update']), None, 'Position cancelled'
-                )
+                self.db.update_position_status(position['id'], 'cancelled', 0, 'Cancelled by signal')
             self.db.log_trading_action('CANCEL', symbol, update_info['update'].get('note', ''), True)
             logger.info(f"🚫 Position cancelled: {symbol}")
         
         elif action == 'INFO':
             if position:
-                self.db.save_position_update(
-                    position[0], message_id, 'INFO',
-                    json.dumps(update_info['update']), profit_pct, 'Profit update'
-                )
-            logger.info(f"ℹ️ Info update: {symbol} - {update_info['update'].get('note', '')}")
+                logger.info(f"ℹ️ Info update: {symbol} - {update_info['update'].get('note', '')}")
     
     async def process_messages(self):
-        """Main message processing loop"""
         logger.info("="*80)
         logger.info(f"🔄 Starting message processing at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
         logger.info("="*80)
         
-        # Fetch all messages
         await self.fetch_messages()
-        
-        # Get unprocessed messages
         unprocessed = self.db.get_unprocessed_messages()
         
         if not unprocessed:
@@ -693,48 +932,55 @@ class AITradingBot:
             logger.info(f"🔍 Analyzing message {msg_id} from {msg_date}")
             logger.info(f"📝 Content: {msg_text[:100]}...")
             
-            # Use AI to analyze message
             analysis = self.ai.analyze_message(msg_text)
-            
             logger.info(f"🤖 AI Analysis: {analysis['type']}")
             
-            # Process based on message type
             if analysis['type'] == 'NEW_POSITION':
                 await self.process_new_position(analysis, msg_id)
-            
             elif analysis['type'] == 'POSITION_UPDATE':
                 await self.process_position_update(analysis, msg_id)
-            
             elif analysis['type'] == 'IGNORE':
                 logger.info(f"⏭️ Ignored: {analysis.get('reason', 'Not a trading message')}")
-            
             elif analysis['type'] == 'ERROR':
                 logger.error(f"⚠️ AI Error: {analysis.get('reason', 'Unknown error')}")
             
-            # Mark as processed
             self.db.mark_message_processed(msg_id, analysis['type'], json.dumps(analysis))
-            
-            # Small delay to avoid rate limits
             await asyncio.sleep(0.5)
         
         logger.info(f"\n{'='*80}")
         logger.info(f"✅ Processing complete - {len(unprocessed)} messages processed")
         logger.info("="*80)
     
+    async def position_sync_loop(self):
+        """Background task to sync positions"""
+        while True:
+            try:
+                await self.sync_positions_with_binance()
+                await self.manage_trailing_stops()
+            except Exception as e:
+                logger.error(f"Error in position sync loop: {e}")
+            
+            await asyncio.sleep(TRADING_CONFIG['position_sync_interval'])
+    
     async def run(self):
-        """Main bot loop"""
         await self.telegram_client.start(phone=TELEGRAM_CONFIG['phone'])
-        logger.info("🚀 AI Trading Bot started successfully")
+        logger.info("🚀 Improved AI Trading Bot started successfully")
         
         print("\n" + "="*80)
-        print("🤖 AI-POWERED TRADING BOT")
+        print("🤖 IMPROVED AI-POWERED TRADING BOT")
         print("="*80)
         print(f"📍 Group ID: {TELEGRAM_CONFIG['group_id']}")
         print(f"📍 Topic ID: {TELEGRAM_CONFIG['topic_id']}")
-        print(f"⏰ Check Interval: {TRADING_CONFIG['fetch_interval']} seconds")
+        print(f"⏰ Message Check: Every {TRADING_CONFIG['fetch_interval']} seconds")
+        print(f"🔄 Position Sync: Every {TRADING_CONFIG['position_sync_interval']} seconds")
         print(f"💰 Risk per trade: {TRADING_CONFIG['risk_percentage']}%")
         print(f"📊 Leverage: {TRADING_CONFIG['leverage']}x")
+        print(f"🛡️ Max Positions: {TRADING_CONFIG['max_open_positions']}")
+        print(f"📈 Trailing Stop: {'Enabled' if TRADING_CONFIG['trailing_stop_enabled'] else 'Disabled'}")
         print("="*80 + "\n")
+        
+        # Start position sync loop in background
+        asyncio.create_task(self.position_sync_loop())
         
         iteration = 0
         while True:
@@ -753,7 +999,7 @@ class AITradingBot:
             await asyncio.sleep(TRADING_CONFIG['fetch_interval'])
 
 async def main():
-    bot = AITradingBot()
+    bot = ImprovedAITradingBot()
     try:
         await bot.run()
     except KeyboardInterrupt:
