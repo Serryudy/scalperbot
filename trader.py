@@ -1,14 +1,12 @@
 from telethon import TelegramClient
 import asyncio
-import re
-from datetime import datetime, timedelta, timezone
 import sqlite3
+from datetime import datetime, timedelta, timezone
+import logging
+import json
 from binance.client import Client
 from binance.enums import *
-import logging
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -34,288 +32,313 @@ BINANCE_CONFIG = {
 TRADING_CONFIG = {
     'leverage': 10,
     'risk_percentage': 10,  # 10% of account
-    'fetch_interval': 300,  # 5 minutes (changed from 60 seconds)
-    'message_lookback': 5  # 5 minutes
+    'fetch_interval': 300,  # 5 minutes
+    'lookback_hours': 24
 }
 
+# DeepSeek API Configuration (Free tier available)
+# Alternative: Use local Ollama or Hugging Face models
+DEEPSEEK_CONFIG = {
+    'api_key': 'sk-abaae5d245c64f899a1302208cc671b1',  # Get from https://platform.deepseek.com
+    'base_url': 'https://api.deepseek.com/v1',
+    'model': 'deepseek-chat'
+}
+
+# Email notifications
 EMAIL_CONFIG = {
     'enabled': True,
     'to_email': 'somapalagalagedara@gmail.com',
-    'from_email': 'somapalagalagedara@gmail.com',  # Gmail account to send from
+    'from_email': 'somapalagalagedara@gmail.com',
     'smtp_server': 'smtp.gmail.com',
     'smtp_port': 587,
-    'password': 'gmsq cxug zkhv jtik',  # Add your Gmail app password here (not regular password)
-    'send_signals': True  # Send signal detection notifications
+    'password': 'gmsq cxug zkhv jtik'
 }
 
-class TradingDatabase:
-    def __init__(self, db_name='trading_bot.db'):
+class MessageDatabase:
+    def __init__(self, db_name='ai_trading_bot.db'):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.create_tables()
     
     def create_tables(self):
         cursor = self.conn.cursor()
+        
+        # Messages table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER UNIQUE NOT NULL,
+                message_text TEXT NOT NULL,
+                message_date TIMESTAMP NOT NULL,
+                fetched_at TIMESTAMP NOT NULL,
+                processed BOOLEAN NOT NULL DEFAULT 0,
+                message_type TEXT,
+                ai_analysis TEXT
+            )
+        ''')
+        
+        # Positions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                stop_loss REAL NOT NULL,
-                take_profit REAL NOT NULL,
-                quantity REAL NOT NULL,
-                leverage INTEGER NOT NULL,
-                opened_at TIMESTAMP NOT NULL,
-                closed_at TIMESTAMP,
-                profit_percentage REAL,
-                status TEXT NOT NULL,
-                signal_time TIMESTAMP NOT NULL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS processed_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_hash TEXT UNIQUE NOT NULL,
-                processed_at TIMESTAMP NOT NULL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS detected_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_hash TEXT UNIQUE NOT NULL,
-                signal_type TEXT NOT NULL,
-                symbol TEXT NOT NULL,
                 entry_price REAL,
+                entry_limit_price REAL,
                 stop_loss REAL,
                 take_profit REAL,
+                quantity REAL,
+                leverage INTEGER,
+                opened_at TIMESTAMP,
+                closed_at TIMESTAMP,
+                status TEXT NOT NULL,
                 profit_percentage REAL,
-                detected_at TIMESTAMP NOT NULL,
-                message_text TEXT NOT NULL,
-                status TEXT NOT NULL
+                source_message_id INTEGER,
+                binance_order_id TEXT,
+                position_details TEXT
             )
         ''')
         
+        # Position updates table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TIMESTAMP NOT NULL
+            CREATE TABLE IF NOT EXISTS position_updates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                update_type TEXT NOT NULL,
+                update_details TEXT NOT NULL,
+                profit_percentage REAL,
+                action_taken TEXT,
+                updated_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (position_id) REFERENCES positions (id)
             )
         ''')
+        
+        # Trading actions log
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trading_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                details TEXT NOT NULL,
+                success BOOLEAN NOT NULL,
+                error_message TEXT,
+                timestamp TIMESTAMP NOT NULL
+            )
+        ''')
+        
         self.conn.commit()
     
-    def is_position_open(self, symbol):
+    def save_message(self, message_id, text, message_date):
+        """Save a message to database"""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO messages 
+                (message_id, message_text, message_date, fetched_at)
+                VALUES (?, ?, ?, ?)
+            ''', (message_id, text, message_date, datetime.now(timezone.utc)))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    
+    def mark_message_processed(self, message_id, message_type, ai_analysis):
+        """Mark message as processed with AI analysis"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT COUNT(*) FROM positions 
-            WHERE symbol = ? AND status = 'open'
-        ''', (symbol,))
-        return cursor.fetchone()[0] > 0
+            UPDATE messages 
+            SET processed = 1, message_type = ?, ai_analysis = ?
+            WHERE message_id = ?
+        ''', (message_type, ai_analysis, message_id))
+        self.conn.commit()
     
-    def add_position(self, symbol, entry, sl, tp, qty, leverage, signal_time):
+    def get_unprocessed_messages(self):
+        """Get all unprocessed messages"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT message_id, message_text, message_date
+            FROM messages 
+            WHERE processed = 0
+            ORDER BY message_date ASC
+        ''')
+        return cursor.fetchall()
+    
+    def save_position(self, symbol, entry, entry_limit, sl, tp, qty, leverage, message_id, order_id=None):
+        """Save a new position"""
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT INTO positions 
-            (symbol, entry_price, stop_loss, take_profit, quantity, leverage, 
-             opened_at, status, signal_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
-        ''', (symbol, entry, sl, tp, qty, leverage, datetime.now(timezone.utc), signal_time))
+            (symbol, entry_price, entry_limit_price, stop_loss, take_profit, 
+             quantity, leverage, opened_at, status, source_message_id, binance_order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+        ''', (symbol, entry, entry_limit, sl, tp, qty, leverage, 
+              datetime.now(timezone.utc), message_id, order_id))
         self.conn.commit()
         return cursor.lastrowid
     
-    def close_position(self, symbol, profit_pct):
+    def get_open_position(self, symbol):
+        """Get open position for a symbol"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            UPDATE positions 
-            SET status = 'closed', closed_at = ?, profit_percentage = ?
+            SELECT * FROM positions 
             WHERE symbol = ? AND status = 'open'
-        ''', (datetime.now(timezone.utc), profit_pct, symbol))
-        self.conn.commit()
+            ORDER BY opened_at DESC LIMIT 1
+        ''', (symbol,))
+        return cursor.fetchone()
     
-    def is_signal_processed(self, signal_hash):
+    def update_position_status(self, position_id, status, profit_pct=None):
+        """Update position status"""
         cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT COUNT(*) FROM processed_signals 
-            WHERE signal_hash = ?
-        ''', (signal_hash,))
-        return cursor.fetchone()[0] > 0
-    
-    def mark_signal_processed(self, signal_hash):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT OR IGNORE INTO processed_signals (signal_hash, processed_at)
-            VALUES (?, ?)
-        ''', (signal_hash, datetime.now(timezone.utc)))
-        self.conn.commit()
-    
-    def save_detected_signal(self, signal, signal_hash, message_text, status='pending'):
-        """Save a detected signal to the database"""
-        cursor = self.conn.cursor()
-        if signal['type'] == 'LONG':
+        if profit_pct is not None:
             cursor.execute('''
-                INSERT OR IGNORE INTO detected_signals 
-                (signal_hash, signal_type, symbol, entry_price, stop_loss, take_profit, 
-                 detected_at, message_text, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (signal_hash, signal['type'], signal['symbol'], signal['entry_price'],
-                  signal['stop_loss'], signal['take_profit'], datetime.now(timezone.utc),
-                  message_text, status))
-        else:  # CLOSE
+                UPDATE positions 
+                SET status = ?, profit_percentage = ?, closed_at = ?
+                WHERE id = ?
+            ''', (status, profit_pct, datetime.now(timezone.utc), position_id))
+        else:
             cursor.execute('''
-                INSERT OR IGNORE INTO detected_signals 
-                (signal_hash, signal_type, symbol, profit_percentage, 
-                 detected_at, message_text, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (signal_hash, signal['type'], signal['symbol'], 
-                  signal.get('profit_percentage', 0), datetime.now(timezone.utc),
-                  message_text, status))
+                UPDATE positions 
+                SET status = ?
+                WHERE id = ?
+            ''', (status, position_id))
         self.conn.commit()
     
-    def is_signal_detected(self, signal_hash):
-        """Check if signal was already detected"""
+    def save_position_update(self, position_id, message_id, update_type, details, profit_pct, action_taken):
+        """Save a position update"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT COUNT(*) FROM detected_signals 
-            WHERE signal_hash = ?
-        ''', (signal_hash,))
-        return cursor.fetchone()[0] > 0
-    
-    def update_signal_status(self, signal_hash, status):
-        """Update status of a detected signal"""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            UPDATE detected_signals 
-            SET status = ?
-            WHERE signal_hash = ?
-        ''', (status, signal_hash))
+            INSERT INTO position_updates 
+            (position_id, message_id, update_type, update_details, 
+             profit_percentage, action_taken, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (position_id, message_id, update_type, details, 
+              profit_pct, action_taken, datetime.now(timezone.utc)))
         self.conn.commit()
     
-    def get_setting(self, key, default=None):
-        """Get a setting value"""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
-        result = cursor.fetchone()
-        return result[0] if result else default
-    
-    def set_setting(self, key, value):
-        """Set a setting value"""
+    def log_trading_action(self, action_type, symbol, details, success, error_msg=None):
+        """Log a trading action"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO settings (key, value, updated_at)
-            VALUES (?, ?, ?)
-        ''', (key, value, datetime.now(timezone.utc)))
+            INSERT INTO trading_actions 
+            (action_type, symbol, details, success, error_message, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (action_type, symbol, details, success, error_msg, datetime.now(timezone.utc)))
         self.conn.commit()
-    
-    def is_first_run_today(self):
-        """Check if this is the first run of the current day"""
-        last_run = self.get_setting('last_run_date')
-        today = datetime.now(timezone.utc).date().isoformat()
-        return last_run != today
-    
-    def mark_run_completed(self):
-        """Mark that a run has been completed for today"""
-        today = datetime.now(timezone.utc).date().isoformat()
-        self.set_setting('last_run_date', today)
-        self.set_setting('initial_setup_done', 'true')
 
-class SignalExtractor:
-    @staticmethod
-    def extract_long_signal(text):
-        """Extract LONG signal details from message"""
-        text_upper = text.upper()
-        
-        # Check if it's a LONG signal
-        if 'LONG' not in text_upper:
-            return None
-        
-        # Extract symbol (patterns: LONG - $API3, LONG - **$API3, **LONG - **$API3, etc.)
-        symbol_pattern = r'LONG\s*-\s*\*{0,2}\s*\$([A-Z0-9]{2,15})'
-        symbol_match = re.search(symbol_pattern, text_upper)
-        if not symbol_match:
-            # Try alternative pattern without dash
-            symbol_pattern = r'LONG\s*\*{0,2}\s*\$([A-Z0-9]{2,15})'
-            symbol_match = re.search(symbol_pattern, text_upper)
-        if not symbol_match:
-            return None
-        
-        symbol = symbol_match.group(1)
-        
-        # Extract entry price (handle multiple formats)
-        # Format: - Entry: 0.8571 or - Entry: 1.836 (30% VOL) or - Entry: 5.749 ( 30% VOL)
-        entry_pattern = r'-\s*ENTRY(?:\s*LIMIT)?[:\s]*(\d+(?:\.\d+)?)'
-        entry_match = re.search(entry_pattern, text_upper)
-        if not entry_match:
-            return None
-        
-        entry_price = float(entry_match.group(1))
-        
-        # Extract stop loss
-        # Format: - SL: 0.8030
-        sl_pattern = r'-\s*SL[:\s]*(\d+(?:\.\d+)?)'
-        sl_match = re.search(sl_pattern, text_upper)
-        if not sl_match:
-            return None
-        
-        stop_loss = float(sl_match.group(1))
-        
-        # Extract take profit
-        # Format: 🎯 TP: 1.5278
-        tp_pattern = r'(?:🎯|TARGET)?\s*TP[:\s]*(\d+(?:\.\d+)?)'
-        tp_match = re.search(tp_pattern, text_upper)
-        if not tp_match:
-            return None
-        
-        take_profit = float(tp_match.group(1))
-        
-        return {
-            'type': 'LONG',
-            'symbol': symbol + 'USDT',  # Convert to Binance format
-            'entry_price': entry_price,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit
-        }
+class AISignalExtractor:
+    """Uses DeepSeek AI to extract and analyze trading signals"""
     
-    @staticmethod
-    def extract_close_signal(text):
-        """Extract CLOSE signal details from message"""
-        text_upper = text.upper()
+    def __init__(self, api_key, base_url, model):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+    
+    def analyze_message(self, message_text):
+        """Analyze message using AI to extract trading signals"""
         
-        # Only treat as CLOSE signal if it explicitly mentions "close" in the message
-        if 'CLOSE' not in text_upper:
-            return None
+        system_prompt = """You are a cryptocurrency trading signal analyzer. Your job is to analyze Telegram messages and extract trading signals or position updates.
+
+Output MUST be valid JSON with one of these structures:
+
+For NEW POSITION signals:
+{
+    "type": "NEW_POSITION",
+    "signal": {
+        "symbol": "SYMBOL",
+        "entry_price": float,
+        "entry_limit": float or null,
+        "stop_loss": float,
+        "take_profit": float or null,
+        "position_type": "LONG" or "SHORT"
+    }
+}
+
+For POSITION UPDATE messages:
+{
+    "type": "POSITION_UPDATE",
+    "update": {
+        "symbol": "SYMBOL",
+        "action": "CLOSE_FULL" or "CLOSE_PARTIAL" or "MODIFY_ENTRY" or "CANCELLED" or "INFO",
+        "profit_percentage": float or null,
+        "new_entry": float or null,
+        "partial_close_pct": float or null,
+        "note": "any relevant information"
+    }
+}
+
+For NON-TRADING messages:
+{
+    "type": "IGNORE",
+    "reason": "explanation"
+}
+
+Rules:
+1. Symbols should be uppercase without $ sign (e.g., "ZORA" not "$ZORA")
+2. Always append "USDT" to symbols (e.g., "ZORAUSDT")
+3. Extract profit percentages from messages like "SYMBOL + 56.1% profit"
+4. Messages mentioning "cancel", "cancelled", or "missed" are UPDATE type with action "CANCELLED"
+5. Messages with just profit updates are UPDATE type with action "INFO"
+6. Only return NEW_POSITION if message contains entry, SL, or TP prices
+7. Return valid JSON only, no markdown or extra text"""
+
+        user_prompt = f"Analyze this trading message:\n\n{message_text}"
         
-        # Extract symbol - pattern: SYMBOL + percentage% profit OR just SYMBOL before "close"
-        # First try: SYMBOL + percentage% profit
-        symbol_pattern = r'([A-Z0-9]{2,15})\s*(?:\+|\s+EVERYONE\s+CAN\s+CLOSE)'
-        symbol_match = re.search(symbol_pattern, text_upper)
-        if not symbol_match:
-            return None
-        
-        symbol = symbol_match.group(1)
-        
-        # Extract profit percentage if present
-        profit_pattern = r'(\d+(?:\.\d+)?)\s*%\s*PROFIT'
-        profit_match = re.search(profit_pattern, text_upper)
-        
-        profit_pct = float(profit_match.group(1)) if profit_match else 0
-        
-        return {
-            'type': 'CLOSE',
-            'symbol': symbol + 'USDT',
-            'profit_percentage': profit_pct
-        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 500
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content']
+                
+                # Clean up response (remove markdown if present)
+                content = content.strip()
+                if content.startswith('```json'):
+                    content = content[7:]
+                if content.startswith('```'):
+                    content = content[3:]
+                if content.endswith('```'):
+                    content = content[:-3]
+                content = content.strip()
+                
+                # Parse JSON
+                analysis = json.loads(content)
+                return analysis
+            else:
+                logger.error(f"DeepSeek API error: {response.status_code} - {response.text}")
+                return {"type": "ERROR", "reason": f"API error: {response.status_code}"}
+                
+        except Exception as e:
+            logger.error(f"Error calling DeepSeek API: {e}")
+            return {"type": "ERROR", "reason": str(e)}
 
 class BinanceTrader:
     def __init__(self, api_key, api_secret):
         self.client = Client(api_key, api_secret)
-        
+    
     def get_account_balance(self):
         """Get USDT balance for futures account"""
-        balance = self.client.futures_account_balance()
-        for b in balance:
-            if b['asset'] == 'USDT':
-                return float(b['availableBalance'])
+        try:
+            balance = self.client.futures_account_balance()
+            for b in balance:
+                if b['asset'] == 'USDT':
+                    return float(b['availableBalance'])
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
         return 0
     
     def set_leverage(self, symbol, leverage):
@@ -323,8 +346,10 @@ class BinanceTrader:
         try:
             self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
             logger.info(f"Set {leverage}x leverage for {symbol}")
+            return True
         except Exception as e:
             logger.error(f"Error setting leverage: {e}")
+            return False
     
     def calculate_position_size(self, balance, risk_pct, entry, sl):
         """Calculate position size based on risk"""
@@ -353,32 +378,31 @@ class BinanceTrader:
                     return qty_precision, price_precision
         except Exception as e:
             logger.error(f"Error getting precision: {e}")
-        return 3, 2  # Default precision
+        return 3, 2
     
     def open_long_position(self, signal, leverage, risk_pct):
-        """Open a LONG position on Binance"""
+        """Open a LONG position"""
         try:
             symbol = signal['symbol']
             entry = signal['entry_price']
             sl = signal['stop_loss']
-            tp = signal['take_profit']
+            tp = signal.get('take_profit')
             
             # Set leverage
-            self.set_leverage(symbol, leverage)
+            if not self.set_leverage(symbol, leverage):
+                return None
             
-            # Get account balance
+            # Get balance
             balance = self.get_account_balance()
             logger.info(f"Account balance: {balance} USDT")
             
             # Calculate position size
             qty = self.calculate_position_size(balance, risk_pct, entry, sl)
-            
-            # Get precision
             qty_precision, price_precision = self.get_symbol_precision(symbol)
             qty = round(qty, qty_precision)
             
             if qty <= 0:
-                logger.error(f"Invalid quantity calculated: {qty}")
+                logger.error(f"Invalid quantity: {qty}")
                 return None
             
             logger.info(f"Opening LONG {symbol}: qty={qty}, entry={entry}, sl={sl}, tp={tp}")
@@ -391,9 +415,9 @@ class BinanceTrader:
                 quantity=qty
             )
             
-            logger.info(f"Market order executed: {order}")
+            logger.info(f"✅ Market order executed: {order['orderId']}")
             
-            # Try to set stop loss
+            # Set stop loss
             try:
                 sl_order = self.client.futures_create_order(
                     symbol=symbol,
@@ -403,82 +427,57 @@ class BinanceTrader:
                     quantity=qty,
                     closePosition=True
                 )
-                logger.info(f"Stop loss set: {sl_order}")
+                logger.info(f"✅ Stop loss set: {sl_order['orderId']}")
             except Exception as e:
-                logger.error(f"Failed to set SL from signal, calculating 1:1 RR: {e}")
-                # Calculate 1:1 RR stop loss
-                risk = abs(entry - sl)
-                new_sl = entry - risk
-                try:
-                    sl_order = self.client.futures_create_order(
-                        symbol=symbol,
-                        side=SIDE_SELL,
-                        type=FUTURE_ORDER_TYPE_STOP_MARKET,
-                        stopPrice=round(new_sl, price_precision),
-                        quantity=qty,
-                        closePosition=True
-                    )
-                    sl = new_sl
-                    logger.info(f"Stop loss set with 1:1 RR: {sl_order}")
-                except Exception as e2:
-                    logger.error(f"Failed to set SL even with 1:1 RR: {e2}")
+                logger.error(f"⚠️ Failed to set SL: {e}")
             
-            # Try to set take profit
-            try:
-                tp_order = self.client.futures_create_order(
-                    symbol=symbol,
-                    side=SIDE_SELL,
-                    type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                    stopPrice=round(tp, price_precision),
-                    quantity=qty,
-                    closePosition=True
-                )
-                logger.info(f"Take profit set: {tp_order}")
-            except Exception as e:
-                logger.error(f"Failed to set TP from signal, calculating 1:1 RR: {e}")
-                # Calculate 1:1 RR take profit
-                risk = abs(entry - sl)
-                new_tp = entry + risk
+            # Set take profit if provided
+            if tp:
                 try:
                     tp_order = self.client.futures_create_order(
                         symbol=symbol,
                         side=SIDE_SELL,
                         type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                        stopPrice=round(new_tp, price_precision),
+                        stopPrice=round(tp, price_precision),
                         quantity=qty,
                         closePosition=True
                     )
-                    tp = new_tp
-                    logger.info(f"Take profit set with 1:1 RR: {tp_order}")
-                except Exception as e2:
-                    logger.error(f"Failed to set TP even with 1:1 RR: {e2}")
+                    logger.info(f"✅ Take profit set: {tp_order['orderId']}")
+                except Exception as e:
+                    logger.error(f"⚠️ Failed to set TP: {e}")
             
             return {
                 'symbol': symbol,
                 'entry': entry,
                 'sl': sl,
                 'tp': tp,
-                'quantity': qty
+                'quantity': qty,
+                'order_id': order['orderId']
             }
             
         except Exception as e:
-            logger.error(f"Error opening position: {e}")
+            logger.error(f"❌ Error opening position: {e}")
             return None
     
-    def close_position(self, symbol):
-        """Close a position on Binance"""
+    def close_position(self, symbol, partial_pct=None):
+        """Close a position (full or partial)"""
         try:
-            # Get current position
             positions = self.client.futures_position_information(symbol=symbol)
             
             for pos in positions:
                 if pos['symbol'] == symbol and float(pos['positionAmt']) != 0:
-                    qty = abs(float(pos['positionAmt']))
+                    total_qty = abs(float(pos['positionAmt']))
                     
-                    # Cancel all open orders for this symbol
-                    self.client.futures_cancel_all_open_orders(symbol=symbol)
+                    if partial_pct:
+                        qty = round(total_qty * (partial_pct / 100), 8)
+                        logger.info(f"Closing {partial_pct}% of {symbol}: {qty} units")
+                    else:
+                        qty = total_qty
+                        logger.info(f"Closing full position {symbol}: {qty} units")
+                        # Cancel all open orders
+                        self.client.futures_cancel_all_open_orders(symbol=symbol)
                     
-                    # Close position with market order
+                    # Close with market order
                     order = self.client.futures_create_order(
                         symbol=symbol,
                         side=SIDE_SELL,
@@ -486,73 +485,45 @@ class BinanceTrader:
                         quantity=qty
                     )
                     
-                    logger.info(f"Position closed: {order}")
+                    logger.info(f"✅ Position closed: {order['orderId']}")
                     return True
             
-            logger.info(f"No open position found for {symbol}")
+            logger.warning(f"No open position found for {symbol}")
             return False
             
         except Exception as e:
-            logger.error(f"Error closing position: {e}")
+            logger.error(f"❌ Error closing position: {e}")
             return False
+    
+    def modify_position_entry(self, symbol, new_entry):
+        """Modify position entry (note: can't modify filled orders, this is informational)"""
+        logger.info(f"ℹ️ Entry modification noted for {symbol}: {new_entry}")
+        # In real trading, you would need to close and reopen at new price
+        # For now, just log it
+        return True
 
-class TradingBot:
+class AITradingBot:
     def __init__(self):
         self.telegram_client = TelegramClient(
-            'trading_bot_session',
+            'my_session',
             TELEGRAM_CONFIG['api_id'],
             TELEGRAM_CONFIG['api_hash']
         )
-        self.db = TradingDatabase()
+        self.db = MessageDatabase()
         self.trader = BinanceTrader(
             BINANCE_CONFIG['api_key'],
             BINANCE_CONFIG['api_secret']
         )
-        self.extractor = SignalExtractor()
+        self.ai = AISignalExtractor(
+            DEEPSEEK_CONFIG['api_key'],
+            DEEPSEEK_CONFIG['base_url'],
+            DEEPSEEK_CONFIG['model']
+        )
     
-    def send_email_notification(self, subject, message):
-        """Send notification via email"""
-        if not EMAIL_CONFIG['enabled']:
-            return
-        
-        if not EMAIL_CONFIG['password']:
-            logger.warning("Email password not configured. Skipping email notification.")
-            return
-        
-        try:
-            msg = MIMEMultipart('alternative')
-            msg['From'] = EMAIL_CONFIG['from_email']
-            msg['To'] = EMAIL_CONFIG['to_email']
-            msg['Subject'] = subject
-            
-            # Convert HTML-like formatting to plain text
-            text_message = message.replace('<b>', '').replace('</b>', '')
-            
-            # Create both plain text and HTML versions
-            text_part = MIMEText(text_message, 'plain')
-            html_part = MIMEText(message.replace('\n', '<br>'), 'html')
-            
-            msg.attach(text_part)
-            msg.attach(html_part)
-            
-            # Connect to Gmail SMTP server
-            with smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port']) as server:
-                server.starttls()
-                server.login(EMAIL_CONFIG['from_email'], EMAIL_CONFIG['password'])
-                server.send_message(msg)
-            
-            logger.info(f"Email notification sent: {subject}")
-        except Exception as e:
-            logger.error(f"Failed to send email notification: {e}")
-    
-    async def fetch_recent_messages(self):
-        """Fetch all messages from the start of current day"""
+    async def fetch_messages(self):
+        """Fetch messages from the last 24 hours"""
         messages = []
-        
-        # Always fetch all messages from start of current day
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff_time = today_start
-        logger.info(f"Fetching all messages from {cutoff_time} (start of today)")
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=TRADING_CONFIG['lookback_hours'])
         
         async for message in self.telegram_client.iter_messages(
             TELEGRAM_CONFIG['group_id'],
@@ -561,312 +532,232 @@ class TradingBot:
         ):
             if message.date < cutoff_time:
                 break
+            
             if message.text:
+                # Save to database if new
+                self.db.save_message(message.id, message.text, message.date)
                 messages.append({
+                    'id': message.id,
                     'text': message.text,
                     'date': message.date
                 })
         
         return messages
     
-    def generate_signal_hash(self, signal, message_date):
-        """Generate unique hash for signal to prevent reprocessing"""
-        signal_str = f"{signal['type']}_{signal['symbol']}_{message_date}"
-        return hash(signal_str)
-    
-    async def review_signal_interactive(self, signal, message_text, signal_hash):
-        """Interactive review for first run - ask user to skip or process"""
-        print("\n" + "="*60)
-        print(f"📊 NEW SIGNAL DETECTED")
-        print("="*60)
-        print(f"Type: {signal['type']}")
-        print(f"Symbol: {signal['symbol']}")
+    async def process_new_position(self, signal, message_id):
+        """Process a new position signal"""
+        symbol = signal['signal']['symbol']
         
-        if signal['type'] == 'LONG':
-            print(f"Entry: ${signal['entry_price']:.4f}")
-            print(f"Stop Loss: ${signal['stop_loss']:.4f}")
-            print(f"Take Profit: ${signal['take_profit']:.4f}")
+        logger.info(f"🆕 NEW POSITION SIGNAL: {symbol}")
+        logger.info(f"   Entry: {signal['signal']['entry_price']}")
+        logger.info(f"   SL: {signal['signal']['stop_loss']}")
+        logger.info(f"   TP: {signal['signal'].get('take_profit', 'N/A')}")
+        
+        # Check if position already exists
+        existing_position = self.db.get_open_position(symbol)
+        if existing_position:
+            logger.warning(f"⚠️ Position already open for {symbol}, skipping")
+            self.db.log_trading_action('SKIP', symbol, 'Position already open', False)
+            return
+        
+        # Open position on Binance
+        result = self.trader.open_long_position(
+            signal['signal'],
+            TRADING_CONFIG['leverage'],
+            TRADING_CONFIG['risk_percentage']
+        )
+        
+        if result:
+            # Save to database
+            self.db.save_position(
+                symbol=result['symbol'],
+                entry=result['entry'],
+                entry_limit=signal['signal'].get('entry_limit'),
+                sl=result['sl'],
+                tp=result['tp'],
+                qty=result['quantity'],
+                leverage=TRADING_CONFIG['leverage'],
+                message_id=message_id,
+                order_id=result['order_id']
+            )
+            
+            self.db.log_trading_action(
+                'OPEN_POSITION',
+                symbol,
+                json.dumps(result),
+                True
+            )
+            
+            logger.info(f"✅ Position opened successfully: {symbol}")
         else:
-            print(f"Profit: {signal.get('profit_percentage', 0):+.2f}%")
-        
-        print(f"\nOriginal Message:\n{message_text}")
-        print("="*60)
-        
-        while True:
-            response = input("\nDo you want to process this signal? (y/n/q to quit): ").lower().strip()
-            if response in ['y', 'n', 'q']:
-                return response
-            print("Invalid input. Please enter 'y' for yes, 'n' for no, or 'q' to quit.")
+            self.db.log_trading_action(
+                'OPEN_POSITION',
+                symbol,
+                'Failed to open position',
+                False,
+                'See logs for details'
+            )
+            logger.error(f"❌ Failed to open position: {symbol}")
     
-    async def process_messages(self, is_first_run=False):
-        """Process messages and execute trades"""
-        messages = await self.fetch_recent_messages()
-        logger.info(f"Fetched {len(messages)} messages from today at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    async def process_position_update(self, update_info, message_id):
+        """Process a position update"""
+        symbol = update_info['update']['symbol']
+        action = update_info['update']['action']
+        profit_pct = update_info['update'].get('profit_percentage')
         
-        if is_first_run:
-            print(f"\n🔍 INITIAL SETUP MODE - Found {len(messages)} messages from today")
-            print("You will be asked to review each signal individually.\n")
+        logger.info(f"📊 POSITION UPDATE: {symbol}")
+        logger.info(f"   Action: {action}")
+        logger.info(f"   Profit: {profit_pct}%" if profit_pct else "   Profit: N/A")
         
-        signals_processed = 0
-        signals_skipped = 0
+        # Get position from database
+        position = self.db.get_open_position(symbol)
         
-        for msg in reversed(messages):  # Process oldest first
-            text = msg['text']
-            msg_date = msg['date']
+        if not position and action not in ['CANCELLED', 'INFO']:
+            logger.warning(f"⚠️ No open position found for {symbol}")
+            self.db.log_trading_action('UPDATE_POSITION', symbol, 'No position found', False)
+            return
+        
+        # Handle different actions
+        if action == 'CLOSE_FULL':
+            success = self.trader.close_position(symbol)
+            if success and position:
+                self.db.update_position_status(position[0], 'closed', profit_pct)
+                self.db.save_position_update(
+                    position[0], message_id, 'CLOSE_FULL',
+                    json.dumps(update_info['update']), profit_pct, 'Position closed'
+                )
+                self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {profit_pct}%", True)
+                logger.info(f"✅ Position closed: {symbol} with {profit_pct}% profit")
+        
+        elif action == 'CLOSE_PARTIAL':
+            partial_pct = update_info['update'].get('partial_close_pct', 50)
+            success = self.trader.close_position(symbol, partial_pct)
+            if success and position:
+                self.db.save_position_update(
+                    position[0], message_id, 'CLOSE_PARTIAL',
+                    json.dumps(update_info['update']), profit_pct, f'Closed {partial_pct}%'
+                )
+                self.db.log_trading_action('CLOSE_PARTIAL', symbol, f"Closed {partial_pct}%", True)
+                logger.info(f"✅ Partial close: {symbol} - {partial_pct}%")
+        
+        elif action == 'MODIFY_ENTRY':
+            new_entry = update_info['update'].get('new_entry')
+            if new_entry and position:
+                self.db.save_position_update(
+                    position[0], message_id, 'MODIFY_ENTRY',
+                    json.dumps(update_info['update']), None, f'Entry modified to {new_entry}'
+                )
+                self.db.log_trading_action('MODIFY_ENTRY', symbol, f"New entry: {new_entry}", True)
+                logger.info(f"ℹ️ Entry modified for {symbol}: {new_entry}")
+        
+        elif action == 'CANCELLED':
+            if position:
+                # Close any open position
+                self.trader.close_position(symbol)
+                self.db.update_position_status(position[0], 'cancelled', 0)
+                self.db.save_position_update(
+                    position[0], message_id, 'CANCELLED',
+                    json.dumps(update_info['update']), None, 'Position cancelled'
+                )
+            self.db.log_trading_action('CANCEL', symbol, update_info['update'].get('note', ''), True)
+            logger.info(f"🚫 Position cancelled: {symbol}")
+        
+        elif action == 'INFO':
+            if position:
+                self.db.save_position_update(
+                    position[0], message_id, 'INFO',
+                    json.dumps(update_info['update']), profit_pct, 'Profit update'
+                )
+            logger.info(f"ℹ️ Info update: {symbol} - {update_info['update'].get('note', '')}")
+    
+    async def process_messages(self):
+        """Main message processing loop"""
+        logger.info("="*80)
+        logger.info(f"🔄 Starting message processing at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        logger.info("="*80)
+        
+        # Fetch all messages
+        await self.fetch_messages()
+        
+        # Get unprocessed messages
+        unprocessed = self.db.get_unprocessed_messages()
+        
+        if not unprocessed:
+            logger.info("✓ No new messages to process")
+            return
+        
+        logger.info(f"📬 Found {len(unprocessed)} unprocessed messages")
+        
+        for msg_id, msg_text, msg_date in unprocessed:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🔍 Analyzing message {msg_id} from {msg_date}")
+            logger.info(f"📝 Content: {msg_text[:100]}...")
             
-            # Try to extract LONG signal
-            long_signal = self.extractor.extract_long_signal(text)
-            if long_signal:
-                logger.info(f"LONG signal detected for {long_signal['symbol']} from message at {msg_date}")
-                signal_hash = self.generate_signal_hash(long_signal, msg_date)
-                
-                # Save detected signal to database
-                if not self.db.is_signal_detected(signal_hash):
-                    self.db.save_detected_signal(long_signal, signal_hash, text, 'detected')
-                
-                # Check if already processed
-                if self.db.is_signal_processed(signal_hash):
-                    logger.info(f"Signal already processed: {long_signal['symbol']}")
-                    continue
-                
-                # Check if position already open
-                if self.db.is_position_open(long_signal['symbol']):
-                    logger.info(f"Position already open for {long_signal['symbol']}")
-                    self.db.mark_signal_processed(signal_hash)
-                    self.db.update_signal_status(signal_hash, 'skipped-position-open')
-                    continue
-                
-                # If first run, ask user to review
-                if is_first_run:
-                    response = await self.review_signal_interactive(long_signal, text, signal_hash)
-                    
-                    if response == 'q':
-                        print("\n⚠️  Exiting initial setup. Run the bot again to continue.")
-                        return False  # Signal to stop
-                    
-                    if response == 'n':
-                        logger.info(f"User skipped signal: {long_signal['symbol']}")
-                        self.db.mark_signal_processed(signal_hash)
-                        self.db.update_signal_status(signal_hash, 'skipped-by-user')
-                        continue
-                    
-                    print(f"\n✅ Processing signal for {long_signal['symbol']}...")
-                
-                logger.info(f"New LONG signal detected: {long_signal}")
-                
-                # Execute trade
-                try:
-                    result = self.trader.open_long_position(
-                        long_signal,
-                        TRADING_CONFIG['leverage'],
-                        TRADING_CONFIG['risk_percentage']
-                    )
-                except Exception as trade_error:
-                    error_msg = f"""
-🔴 <b>ERROR OPENING POSITION</b>
-
-<b>Symbol:</b> {long_signal['symbol']}
-<b>Error:</b> {str(trade_error)}
-<b>Signal Details:</b>
-- Entry: ${long_signal['entry_price']:.4f}
-- Stop Loss: ${long_signal['stop_loss']:.4f}
-- Take Profit: ${long_signal['take_profit']:.4f}
-
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
-"""
-                    self.send_email_notification(f"🔴 Error Opening Position - {long_signal['symbol']}", error_msg)
-                    logger.error(f"Error opening position for {long_signal['symbol']}: {trade_error}")
-                    self.db.update_signal_status(signal_hash, 'error')
-                    result = None
-                
-                if result:
-                    # Save to database
-                    self.db.add_position(
-                        result['symbol'],
-                        result['entry'],
-                        result['sl'],
-                        result['tp'],
-                        result['quantity'],
-                        TRADING_CONFIG['leverage'],
-                        msg_date
-                    )
-                    self.db.mark_signal_processed(signal_hash)
-                    self.db.update_signal_status(signal_hash, 'executed')
-                    logger.info(f"Position opened and logged: {result['symbol']}")
-                    
-                    # Send notification
-                    notification = f"""
-🟢 <b>POSITION OPENED</b>
-
-<b>Symbol:</b> {result['symbol']}
-<b>Type:</b> LONG
-<b>Leverage:</b> {TRADING_CONFIG['leverage']}x
-<b>Entry Price:</b> ${result['entry']:.4f}
-<b>Stop Loss:</b> ${result['sl']:.4f}
-<b>Take Profit:</b> ${result['tp']:.4f}
-<b>Quantity:</b> {result['quantity']:.4f}
-<b>Risk:</b> {TRADING_CONFIG['risk_percentage']}%
-
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
-"""
-                    self.send_email_notification(f"🟢 Position Opened - {result['symbol']}", notification)
+            # Use AI to analyze message
+            analysis = self.ai.analyze_message(msg_text)
             
-            # Try to extract CLOSE signal
-            close_signal = self.extractor.extract_close_signal(text)
-            if close_signal:
-                signal_hash = self.generate_signal_hash(close_signal, msg_date)
-                
-                # Save detected signal to database
-                if not self.db.is_signal_detected(signal_hash):
-                    self.db.save_detected_signal(close_signal, signal_hash, text, 'detected')
-                
-                # Check if already processed
-                if self.db.is_signal_processed(signal_hash):
-                    logger.info(f"Close signal already processed: {close_signal['symbol']}")
-                    continue
-                
-                # If first run, automatically process CLOSE signals without asking
-                if is_first_run:
-                    logger.info(f"First run: Auto-processing CLOSE signal for {close_signal['symbol']}")
-                
-                logger.info(f"CLOSE signal detected: {close_signal}")
-                
-                # Check if position exists in database
-                if self.db.is_position_open(close_signal['symbol']):
-                    # Close position on Binance
-                    try:
-                        close_success = self.trader.close_position(close_signal['symbol'])
-                    except Exception as close_error:
-                        error_msg = f"""
-🔴 <b>ERROR CLOSING POSITION</b>
-
-<b>Symbol:</b> {close_signal['symbol']}
-<b>Error:</b> {str(close_error)}
-<b>Expected Profit:</b> {close_signal['profit_percentage']:+.2f}%
-
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
-"""
-                        self.send_email_notification(f"🔴 Error Closing Position - {close_signal['symbol']}", error_msg)
-                        logger.error(f"Error closing position for {close_signal['symbol']}: {close_error}")
-                        self.db.update_signal_status(signal_hash, 'error')
-                        close_success = False
-                    
-                    if close_success:
-                        # Update database
-                        self.db.close_position(
-                            close_signal['symbol'],
-                            close_signal['profit_percentage']
-                        )
-                        self.db.mark_signal_processed(signal_hash)
-                        self.db.update_signal_status(signal_hash, 'executed')
-                        logger.info(f"Position closed: {close_signal['symbol']} with {close_signal['profit_percentage']}% profit")
-                        
-                        # Send notification
-                        profit_emoji = "🟢" if close_signal['profit_percentage'] > 0 else "🔴"
-                        status = 'WIN' if close_signal['profit_percentage'] > 0 else 'LOSS'
-                        notification = f"""
-{profit_emoji} <b>POSITION CLOSED</b>
-
-<b>Symbol:</b> {close_signal['symbol']}
-<b>Profit:</b> {close_signal['profit_percentage']:+.2f}%
-<b>Status:</b> {'✅ WIN' if close_signal['profit_percentage'] > 0 else '❌ LOSS'}
-
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
-"""
-                        self.send_email_notification(f"{profit_emoji} Position Closed - {close_signal['symbol']} ({status})", notification)
-                else:
-                    logger.info(f"No open position found for {close_signal['symbol']}")
-                    self.db.mark_signal_processed(signal_hash)
-                    self.db.update_signal_status(signal_hash, 'no-position')
+            logger.info(f"🤖 AI Analysis: {analysis['type']}")
+            
+            # Process based on message type
+            if analysis['type'] == 'NEW_POSITION':
+                await self.process_new_position(analysis, msg_id)
+            
+            elif analysis['type'] == 'POSITION_UPDATE':
+                await self.process_position_update(analysis, msg_id)
+            
+            elif analysis['type'] == 'IGNORE':
+                logger.info(f"⏭️ Ignored: {analysis.get('reason', 'Not a trading message')}")
+            
+            elif analysis['type'] == 'ERROR':
+                logger.error(f"⚠️ AI Error: {analysis.get('reason', 'Unknown error')}")
+            
+            # Mark as processed
+            self.db.mark_message_processed(msg_id, analysis['type'], json.dumps(analysis))
+            
+            # Small delay to avoid rate limits
+            await asyncio.sleep(0.5)
         
-        logger.info(f"Message processing completed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        return True  # Continue running
+        logger.info(f"\n{'='*80}")
+        logger.info(f"✅ Processing complete - {len(unprocessed)} messages processed")
+        logger.info("="*80)
     
     async def run(self):
-        """Main loop to run the bot"""
+        """Main bot loop"""
         await self.telegram_client.start(phone=TELEGRAM_CONFIG['phone'])
-        logger.info("Bot started successfully")
+        logger.info("🚀 AI Trading Bot started successfully")
         
-        # Check if this is the first run of the day
-        is_first_run = self.db.is_first_run_today()
+        print("\n" + "="*80)
+        print("🤖 AI-POWERED TRADING BOT")
+        print("="*80)
+        print(f"📍 Group ID: {TELEGRAM_CONFIG['group_id']}")
+        print(f"📍 Topic ID: {TELEGRAM_CONFIG['topic_id']}")
+        print(f"⏰ Check Interval: {TRADING_CONFIG['fetch_interval']} seconds")
+        print(f"💰 Risk per trade: {TRADING_CONFIG['risk_percentage']}%")
+        print(f"📊 Leverage: {TRADING_CONFIG['leverage']}x")
+        print("="*80 + "\n")
         
-        if is_first_run:
-            print("\n" + "="*60)
-            print("🚀 FIRST RUN OF THE DAY - INITIAL SETUP MODE")
-            print("="*60)
-            print("\nThe bot will fetch ALL messages from today and let you")
-            print("review each signal individually.")
-            print("\nFor each signal, you can:")
-            print("  - Press 'y' to process and open the position")
-            print("  - Press 'n' to skip (if you already opened it manually)")
-            print("  - Press 'q' to quit and resume later")
-            print("\n" + "="*60 + "\n")
-            
-            # Process all today's messages with interactive review
-            continue_running = await self.process_messages(is_first_run=True)
-            
-            if not continue_running:
-                logger.info("Initial setup interrupted by user. Exiting.")
-                return
-            
-            # Mark first run as completed
-            self.db.mark_run_completed()
-            
-            print("\n" + "="*60)
-            print("✅ INITIAL SETUP COMPLETED")
-            print("="*60)
-            print("\nThe bot will now run in continuous mode.")
-            print("Every 5 minutes, it will:")
-            print("  - Fetch ALL messages from today")
-            print("  - Process only NEW signals automatically")
-            print("  - Skip signals already in database")
-            print("\nPress Ctrl+C to stop the bot.")
-            print("="*60 + "\n")
-        
-        # Continuous mode - check every 5 minutes
+        iteration = 0
         while True:
             try:
-                logger.info(f"Starting message check cycle at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                iteration += 1
+                logger.info(f"\n{'#'*80}")
+                logger.info(f"ITERATION #{iteration}")
+                logger.info(f"{'#'*80}\n")
                 
-                # Check if it's a new day - if so, enter first run mode again
-                if self.db.is_first_run_today():
-                    logger.info("New day detected - entering first run mode")
-                    print("\n" + "="*60)
-                    print("📅 NEW DAY DETECTED - ENTERING INITIAL SETUP MODE")
-                    print("="*60 + "\n")
-                    
-                    continue_running = await self.process_messages(is_first_run=True)
-                    
-                    if not continue_running:
-                        logger.info("Initial setup interrupted by user. Exiting.")
-                        return
-                    
-                    self.db.mark_run_completed()
-                    print("\n✅ Initial setup for new day completed. Continuing in automatic mode.\n")
-                else:
-                    # Normal processing - automatic mode (fetches all today's messages every 5min)
-                    await self.process_messages(is_first_run=False)
+                await self.process_messages()
+                
             except Exception as e:
-                error_msg = f"""
-🔴 <b>CRITICAL ERROR IN BOT</b>
-
-<b>Error Type:</b> {type(e).__name__}
-<b>Error Message:</b> {str(e)}
-
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
-
-The bot will continue running and retry in the next cycle.
-"""
-                self.send_email_notification("🔴 Critical Error in Trading Bot", error_msg)
-                logger.error(f"Error in main loop: {e}")
+                logger.error(f"❌ Error in main loop: {e}", exc_info=True)
             
-            # Wait for next iteration (5 minutes)
-            logger.info(f"Sleeping for {TRADING_CONFIG['fetch_interval']} seconds until next check...")
+            logger.info(f"\n⏳ Sleeping for {TRADING_CONFIG['fetch_interval']} seconds...\n")
             await asyncio.sleep(TRADING_CONFIG['fetch_interval'])
 
 async def main():
-    bot = TradingBot()
-    await bot.run()
+    bot = AITradingBot()
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        logger.info("\n\n👋 Bot stopped by user")
 
 if __name__ == '__main__':
     asyncio.run(main())
