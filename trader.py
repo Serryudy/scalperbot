@@ -23,8 +23,8 @@ TELEGRAM_CONFIG = {
     'api_id': 23008284,
     'api_hash': '9b753f6de26369ddff1f498ce4d21fb5',
     'phone': '+94781440205',
-    'group_id': -1002039861131,
-    'topic_id': 40011
+    'group_id': -1001573488012,
+    #'topic_id': 40011
 }
 
 BINANCE_CONFIG = {
@@ -768,7 +768,7 @@ class ImprovedAITradingBot:
         
         async for message in self.telegram_client.iter_messages(
             TELEGRAM_CONFIG['group_id'],
-            reply_to=TELEGRAM_CONFIG['topic_id'],
+            #reply_to=TELEGRAM_CONFIG['topic_id'],
             limit=None
         ):
             if message.date < cutoff_time:
@@ -970,7 +970,7 @@ class ImprovedAITradingBot:
         print("🤖 IMPROVED AI-POWERED TRADING BOT")
         print("="*80)
         print(f"📍 Group ID: {TELEGRAM_CONFIG['group_id']}")
-        print(f"📍 Topic ID: {TELEGRAM_CONFIG['topic_id']}")
+        #print(f"📍 Topic ID: {TELEGRAM_CONFIG['topic_id']}")
         print(f"⏰ Message Check: Every {TRADING_CONFIG['fetch_interval']} seconds")
         print(f"🔄 Position Sync: Every {TRADING_CONFIG['position_sync_interval']} seconds")
         print(f"💰 Risk per trade: {TRADING_CONFIG['risk_percentage']}%")
