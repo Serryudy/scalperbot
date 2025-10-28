@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 import logging
 import json
+import time
 from binance.client import Client
 from binance.enums import *
 import requests
@@ -267,7 +268,7 @@ class AISignalExtractor:
         self.model = model
     
     def analyze_message(self, message_text):
-        system_prompt = """You are a cryptocurrency trading signal analyzer. Analyze Telegram messages and extract trading signals or position updates.
+        system_prompt = """You are an intelligent cryptocurrency trading signal analyzer. Analyze Telegram messages and extract trading signals or position updates. Use your intelligence to make smart decisions about position management.
 
 Output MUST be valid JSON with one of these structures:
 
@@ -289,10 +290,11 @@ For POSITION UPDATE messages:
     "type": "POSITION_UPDATE",
     "update": {
         "symbol": "SYMBOL",
-        "action": "CLOSE_FULL" or "CLOSE_PARTIAL" or "MODIFY_ENTRY" or "CANCELLED" or "INFO",
+        "action": "CLOSE_FULL" or "CLOSE_PARTIAL" or "HOLD" or "CANCELLED" or "INFO",
         "profit_percentage": float or null,
-        "new_entry": float or null,
         "partial_close_pct": float or null,
+        "confidence": float (0-100),
+        "reasoning": "brief explanation of decision",
         "note": "any relevant information"
     }
 }
@@ -303,13 +305,29 @@ For NON-TRADING messages:
     "reason": "explanation"
 }
 
-Rules:
-1. Symbols should be uppercase without $ sign, append USDT (e.g., "ZORAUSDT")
-2. Extract profit percentages from "SYMBOL + 56.1% profit" patterns
-3. Messages with "cancel", "cancelled", or "missed" are UPDATE with action "CANCELLED"
-4. Just profit updates are UPDATE with action "INFO"
-5. Only return NEW_POSITION if message contains entry, SL, or TP prices
-6. Return valid JSON only, no markdown"""
+INTELLIGENT DECISION RULES:
+1. Symbols: uppercase without $ sign, append USDT (e.g., "ZORAUSDT")
+2. Profit updates: Analyze context to decide action:
+   - High profit (>30%): Consider CLOSE_PARTIAL (50-75%) to secure gains
+   - Medium profit (15-30%): Usually HOLD but watch for risk signals
+   - Low profit (<15%): Usually HOLD unless message indicates problems
+   - Negative/small profit with warning signs: Consider CLOSE_FULL
+3. Messages with "cancel", "cancelled", "missed": action "CANCELLED"
+4. Risk indicators (e.g., "consolidating", "resistance", "risky", "overbought"): 
+   - If profit >20%: Suggest CLOSE_PARTIAL
+   - If profit <10%: Suggest CLOSE_FULL
+5. Positive momentum (e.g., "breaking out", "strong support", "bullish"): HOLD
+6. Set confidence level (0-100) based on message clarity
+7. Provide brief reasoning for your decision
+8. Only return NEW_POSITION if message contains entry, SL, or TP prices
+9. Return valid JSON only, no markdown
+
+EXAMPLES:
+- "BTC +45% profit" → CLOSE_PARTIAL (60-70%), high profit taking
+- "ETH +25% consolidating" → CLOSE_PARTIAL (50%), profit + risk signal
+- "SOL +18% strong momentum" → HOLD, profit with bullish signal
+- "DOGE +8% facing resistance" → CLOSE_FULL, low profit + warning
+- "ADA +40% breaking ATH" → HOLD or CLOSE_PARTIAL (30%), momentum vs profit"""
 
         user_prompt = f"Analyze this trading message:\n\n{message_text}"
         
@@ -357,6 +375,19 @@ Rules:
 class BinanceTrader:
     def __init__(self, api_key, api_secret):
         self.client = Client(api_key, api_secret)
+        # Increase recvWindow to handle time sync issues (default is 5000ms, increase to 60000ms)
+        self.client.timestamp_offset = 0
+        self._sync_time_offset()
+    
+    def _sync_time_offset(self):
+        """Synchronize time with Binance server to prevent timestamp errors"""
+        try:
+            server_time = self.client.get_server_time()
+            local_time = int(time.time() * 1000)
+            self.client.timestamp_offset = server_time['serverTime'] - local_time
+            logger.info(f"✅ Time synchronized with Binance (offset: {self.client.timestamp_offset}ms)")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not sync time with Binance: {e}")
     
     def get_account_balance(self):
         try:
@@ -383,24 +414,50 @@ class BinanceTrader:
             positions = self.client.futures_position_information(symbol=symbol)
             for pos in positions:
                 if pos['symbol'] == symbol:
+                    # Safely get leverage with fallback
+                    try:
+                        leverage_value = int(pos.get('leverage', 10))
+                    except (ValueError, TypeError):
+                        leverage_value = 10  # Default to 10x if leverage info unavailable
+                    
                     return {
                         'symbol': symbol,
                         'position_amt': float(pos['positionAmt']),
                         'entry_price': float(pos['entryPrice']),
                         'unrealized_pnl': float(pos['unRealizedProfit']),
-                        'leverage': int(pos['leverage']),
+                        'leverage': leverage_value,
                         'is_open': float(pos['positionAmt']) != 0
                     }
         except Exception as e:
-            logger.error(f"Error getting position info: {e}")
+            logger.error(f"Error getting position info for {symbol}: {e}")
         return None
     
     def set_leverage(self, symbol, leverage):
         try:
-            self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            # Use increased recvWindow for time-sensitive operations
+            self.client.futures_change_leverage(
+                symbol=symbol, 
+                leverage=leverage,
+                recvWindow=60000  # 60 seconds window
+            )
             logger.info(f"Set {leverage}x leverage for {symbol}")
             return True
         except Exception as e:
+            # If timestamp error, try to resync time and retry once
+            if "Timestamp" in str(e) or "recvWindow" in str(e):
+                logger.warning(f"⚠️ Time sync error detected, resyncing...")
+                self._sync_time_offset()
+                try:
+                    self.client.futures_change_leverage(
+                        symbol=symbol, 
+                        leverage=leverage,
+                        recvWindow=60000
+                    )
+                    logger.info(f"✅ Set {leverage}x leverage for {symbol} (after resync)")
+                    return True
+                except Exception as e2:
+                    logger.error(f"Error setting leverage after resync: {e2}")
+                    return False
             logger.error(f"Error setting leverage: {e}")
             return False
     
@@ -862,10 +919,14 @@ class ImprovedAITradingBot:
         symbol = update_info['update']['symbol']
         action = update_info['update']['action']
         profit_pct = update_info['update'].get('profit_percentage')
+        confidence = update_info['update'].get('confidence', 0)
+        reasoning = update_info['update'].get('reasoning', 'No reasoning provided')
         
         logger.info(f"📊 POSITION UPDATE: {symbol}")
         logger.info(f"   Action: {action}")
         logger.info(f"   Profit: {profit_pct}%" if profit_pct else "   Profit: N/A")
+        logger.info(f"   AI Confidence: {confidence}%")
+        logger.info(f"   AI Reasoning: {reasoning}")
         
         position = self.db.get_open_position(symbol)
         
@@ -877,30 +938,63 @@ class ImprovedAITradingBot:
         if action == 'CLOSE_FULL':
             success = self.trader.close_position(symbol)
             if success and position:
-                self.db.update_position_status(position['id'], 'closed', profit_pct, 'Closed by AI signal')
-                self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {profit_pct}%", True)
+                self.db.update_position_status(position['id'], 'closed', profit_pct, f'AI Decision: {reasoning}')
+                self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {profit_pct}% | Reasoning: {reasoning}", True)
                 
-                profit_emoji = "🟢" if profit_pct > 0 else "🔴"
-                status = 'WIN' if profit_pct > 0 else 'LOSS'
+                profit_emoji = "🟢" if profit_pct and profit_pct > 0 else "🔴"
+                status = 'WIN' if profit_pct and profit_pct > 0 else 'LOSS'
                 notification = f"""
 {profit_emoji} <b>POSITION CLOSED BY AI</b>
 
 <b>Symbol:</b> {symbol}
-<b>Profit:</b> {profit_pct:+.2f}%
-<b>Status:</b> {'✅ WIN' if profit_pct > 0 else '❌ LOSS'}
+<b>Profit:</b> {profit_pct:+.2f}% {f'({status})' if profit_pct else ''}
 <b>Action:</b> Full Close
+<b>AI Confidence:</b> {confidence}%
+<b>Reasoning:</b> {reasoning}
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 """
-                self.send_email_notification(f"{profit_emoji} AI Closed Position - {symbol} ({status})", notification)
+                self.send_email_notification(f"{profit_emoji} AI Closed - {symbol} ({status})", notification)
                 logger.info(f"✅ Position closed: {symbol} with {profit_pct}% profit")
         
         elif action == 'CLOSE_PARTIAL':
             partial_pct = update_info['update'].get('partial_close_pct', 50)
             success = self.trader.close_position(symbol, partial_pct)
             if success and position:
-                self.db.log_trading_action('CLOSE_PARTIAL', symbol, f"Closed {partial_pct}%", True)
+                self.db.log_trading_action('CLOSE_PARTIAL', symbol, f"Closed {partial_pct}% | Reasoning: {reasoning}", True)
+                
+                notification = f"""
+🟡 <b>PARTIAL CLOSE BY AI</b>
+
+<b>Symbol:</b> {symbol}
+<b>Closed:</b> {partial_pct}%
+<b>Current Profit:</b> {profit_pct:+.2f}%
+<b>AI Confidence:</b> {confidence}%
+<b>Reasoning:</b> {reasoning}
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                self.send_email_notification(f"🟡 AI Partial Close - {symbol}", notification)
                 logger.info(f"✅ Partial close: {symbol} - {partial_pct}%")
+        
+        elif action == 'HOLD':
+            if position:
+                logger.info(f"💎 Holding {symbol} - AI Decision: {reasoning}")
+                self.db.log_trading_action('HOLD', symbol, f"Profit: {profit_pct}% | Reasoning: {reasoning}", True)
+                
+                notification = f"""
+💎 <b>AI DECISION: HOLD POSITION</b>
+
+<b>Symbol:</b> {symbol}
+<b>Current Profit:</b> {profit_pct:+.2f}%
+<b>AI Confidence:</b> {confidence}%
+<b>Reasoning:</b> {reasoning}
+
+Position remains open. Continuing to monitor.
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                self.send_email_notification(f"💎 AI Holds - {symbol}", notification)
         
         elif action == 'CANCELLED':
             if position:
@@ -908,6 +1002,16 @@ class ImprovedAITradingBot:
                 self.db.update_position_status(position['id'], 'cancelled', 0, 'Cancelled by signal')
             self.db.log_trading_action('CANCEL', symbol, update_info['update'].get('note', ''), True)
             logger.info(f"🚫 Position cancelled: {symbol}")
+            
+            notification = f"""
+🚫 <b>POSITION CANCELLED</b>
+
+<b>Symbol:</b> {symbol}
+<b>Reason:</b> {update_info['update'].get('note', 'Cancelled by signal')}
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+            self.send_email_notification(f"🚫 Cancelled - {symbol}", notification)
         
         elif action == 'INFO':
             if position:
