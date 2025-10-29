@@ -44,7 +44,16 @@ TRADING_CONFIG = {
     'trailing_stop_activation': 20,  # Activate at 20% profit
     'trailing_stop_distance': 10,  # Trail 10% below peak
     'breakeven_at_profit': 15,  # Move SL to breakeven at 15% profit
-    'position_sync_interval': 60  # Sync with Binance every 60 seconds
+    'position_sync_interval': 60,  # Sync with Binance every 60 seconds
+    # Auto profit taking settings (only for positions older than 3 days)
+    'auto_profit_taking_enabled': True,
+    'auto_profit_age_threshold_hours': 72,  # Only auto-close positions older than 3 days (72 hours)
+    'profit_take_levels': [
+        {'profit_pct': 25, 'close_pct': 25},   # At 25% profit, close 25% of position
+        {'profit_pct': 50, 'close_pct': 25},   # At 50% profit, close another 25% (50% total)
+        {'profit_pct': 75, 'close_pct': 25},   # At 75% profit, close another 25% (75% total)
+        {'profit_pct': 100, 'close_pct': 25}   # At 100% profit, close remaining 25% (100% total)
+    ]
 }
 
 DEEPSEEK_CONFIG = {
@@ -408,6 +417,34 @@ class BinanceTrader:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
     
+    def get_all_open_positions_from_binance(self):
+        """Get all open positions directly from Binance"""
+        try:
+            positions = self.client.futures_position_information()
+            open_positions = []
+            
+            for pos in positions:
+                position_amt = float(pos['positionAmt'])
+                if position_amt != 0:  # Position is open
+                    try:
+                        leverage_value = int(pos.get('leverage', 10))
+                    except (ValueError, TypeError):
+                        leverage_value = 10
+                    
+                    open_positions.append({
+                        'symbol': pos['symbol'],
+                        'position_amt': position_amt,
+                        'entry_price': float(pos['entryPrice']),
+                        'unrealized_pnl': float(pos['unRealizedProfit']),
+                        'leverage': leverage_value,
+                        'side': 'LONG' if position_amt > 0 else 'SHORT'
+                    })
+            
+            return open_positions
+        except Exception as e:
+            logger.error(f"Error getting all positions from Binance: {e}")
+            return []
+    
     def get_position_info(self, symbol):
         """Get current position information from Binance"""
         try:
@@ -673,9 +710,13 @@ class ImprovedAITradingBot:
             logger.error(f"Failed to send email: {e}")
     
     def can_open_new_position(self):
-        """Check if we can open a new position based on risk limits"""
-        open_count = self.db.count_open_positions()
+        """Check if we can open a new position based on risk limits - using BINANCE data"""
+        # Get actual open positions from Binance, not database
+        binance_positions = self.trader.get_all_open_positions_from_binance()
+        open_count = len(binance_positions)
         total_risk = open_count * TRADING_CONFIG['risk_percentage']
+        
+        logger.info(f"📊 Current open positions on Binance: {open_count}")
         
         if open_count >= TRADING_CONFIG['max_open_positions']:
             logger.warning(f"⚠️ Max positions reached: {open_count}/{TRADING_CONFIG['max_open_positions']}")
@@ -818,6 +859,217 @@ class ImprovedAITradingBot:
                 
             except Exception as e:
                 logger.error(f"Error managing trailing stop for {position['symbol']}: {e}")
+    
+    async def monitor_and_take_profits(self):
+        """Monitor open positions from Binance and automatically take profits at intervals - ONLY for positions older than 3 days"""
+        if not TRADING_CONFIG['auto_profit_taking_enabled']:
+            return
+        
+        logger.info("💰 Monitoring positions for automatic profit taking...")
+        
+        # Get actual open positions from Binance
+        binance_positions = self.trader.get_all_open_positions_from_binance()
+        
+        if not binance_positions:
+            logger.info("   No open positions on Binance")
+            return
+        
+        logger.info(f"   Found {len(binance_positions)} open positions on Binance")
+        
+        for binance_pos in binance_positions:
+            try:
+                symbol = binance_pos['symbol']
+                entry = binance_pos['entry_price']
+                position_amt = abs(binance_pos['position_amt'])
+                
+                # Get current price
+                current_price = self.trader.get_current_price(symbol)
+                if not current_price or entry == 0:
+                    continue
+                
+                # Calculate profit percentage
+                profit_pct = ((current_price - entry) / entry) * 100
+                
+                # Get database position to check age and track profit levels
+                db_position = self.db.get_open_position(symbol)
+                if not db_position:
+                    logger.warning(f"   ⚠️ {symbol} on Binance but not in DB - syncing")
+                    continue
+                
+                # Check position age - convert opened_at string to datetime if needed
+                opened_at = db_position['opened_at']
+                if isinstance(opened_at, str):
+                    # Parse string datetime to datetime object
+                    opened_at = datetime.fromisoformat(opened_at.replace('Z', '+00:00'))
+                
+                position_age_hours = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
+                
+                logger.info(f"   {symbol}: Entry=${entry:.4f}, Current=${current_price:.4f}, Profit={profit_pct:.2f}%, Age={position_age_hours:.1f}h")
+                
+                # ONLY apply automatic profit taking if position is older than threshold
+                if position_age_hours < TRADING_CONFIG['auto_profit_age_threshold_hours']:
+                    logger.info(f"   ⏳ {symbol}: Position too new ({position_age_hours:.1f}h < {TRADING_CONFIG['auto_profit_age_threshold_hours']}h) - waiting for Telegram signals")
+                    continue
+                
+                logger.info(f"   ✅ {symbol}: Position old enough ({position_age_hours:.1f}h) - auto profit taking active")
+                
+                # Get taken profit levels from database
+                taken_levels = self._get_taken_profit_levels(db_position)
+                
+                # Find ALL levels that should be taken (including missed ones)
+                levels_to_take = []
+                for level in TRADING_CONFIG['profit_take_levels']:
+                    target_profit = level['profit_pct']
+                    close_pct = level['close_pct']
+                    
+                    # If current profit is above this level AND level hasn't been taken yet
+                    if profit_pct >= target_profit and target_profit not in taken_levels:
+                        levels_to_take.append(level)
+                
+                # Execute ALL missed levels in order
+                if levels_to_take:
+                    logger.info(f"🎯 {symbol}: Found {len(levels_to_take)} profit level(s) to execute")
+                    
+                    total_to_close = 0
+                    levels_taken = []
+                    
+                    for level in levels_to_take:
+                        total_to_close += level['close_pct']
+                        levels_taken.append(level['profit_pct'])
+                    
+                    # If total is 100% or more, just close entire position
+                    if total_to_close >= 100:
+                        logger.info(f"🚀 {symbol}: Closing 100% of position (multiple levels: {levels_taken})")
+                        success = self.trader.close_position(symbol)  # Full close
+                        
+                        if success:
+                            # Mark all levels as taken
+                            for level in levels_to_take:
+                                self._mark_profit_level_taken(db_position['id'], level['profit_pct'])
+                            
+                            # Update position status to closed
+                            self.db.update_position_status(
+                                db_position['id'],
+                                'closed',
+                                profit_pct,
+                                f'Auto-closed 100% at {profit_pct:.2f}% profit (levels: {levels_taken})'
+                            )
+                            
+                            self.db.log_trading_action(
+                                'AUTO_PROFIT_TAKE_FULL',
+                                symbol,
+                                f"Closed 100% at {profit_pct:.2f}% profit - Executed levels: {levels_taken} (Position age: {position_age_hours:.1f}h)",
+                                True
+                            )
+                            
+                            notification = f"""
+💰🎯 <b>AUTOMATIC FULL CLOSE (3+ DAYS OLD)</b>
+
+<b>Symbol:</b> {symbol}
+<b>Position Age:</b> {position_age_hours:.1f} hours
+<b>Current Profit:</b> {profit_pct:.2f}%
+<b>Levels Executed:</b> {', '.join([f"{l}%" for l in levels_taken])}
+<b>Position Closed:</b> 100%
+<b>Entry:</b> ${entry:.4f}
+<b>Exit:</b> ${current_price:.4f}
+
+🤖 Multiple profit levels reached - full close executed
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                            self.send_email_notification(
+                                f"💰 Full Auto Close - {symbol} ({profit_pct:.1f}%)",
+                                notification
+                            )
+                            
+                            logger.info(f"✅ Full position closed: {symbol} at {profit_pct:.2f}% (executed {len(levels_taken)} levels)")
+                    else:
+                        # Close the cumulative percentage
+                        logger.info(f"📊 {symbol}: Closing {total_to_close}% (levels: {levels_taken})")
+                        success = self.trader.close_position(symbol, total_to_close)
+                        
+                        if success:
+                            # Mark all levels as taken
+                            for level in levels_to_take:
+                                self._mark_profit_level_taken(db_position['id'], level['profit_pct'])
+                            
+                            self.db.log_trading_action(
+                                'AUTO_PROFIT_TAKE_MULTI',
+                                symbol,
+                                f"Closed {total_to_close}% at {profit_pct:.2f}% profit - Executed levels: {levels_taken} (Position age: {position_age_hours:.1f}h)",
+                                True
+                            )
+                            
+                            notification = f"""
+💰 <b>AUTOMATIC PROFIT TAKEN (3+ DAYS OLD)</b>
+
+<b>Symbol:</b> {symbol}
+<b>Position Age:</b> {position_age_hours:.1f} hours
+<b>Current Profit:</b> {profit_pct:.2f}%
+<b>Levels Executed:</b> {', '.join([f"{l}%" for l in levels_taken])}
+<b>This Close:</b> {total_to_close}%
+<b>Remaining:</b> {100 - total_to_close}%
+<b>Exit Price:</b> ${current_price:.4f}
+
+🤖 Multiple profit levels caught up in one iteration
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                            self.send_email_notification(
+                                f"💰 Auto Profit Multi - {symbol} ({total_to_close}%)",
+                                notification
+                            )
+                            
+                            logger.info(f"✅ Closed {total_to_close}% of {symbol} (executed {len(levels_taken)} levels at once)")
+                        else:
+                            logger.error(f"❌ Failed to take profit for {symbol}")
+                else:
+                    logger.info(f"   ⏸️ {symbol}: No new profit levels to take (taken: {taken_levels})")
+                
+                # Check if all levels taken
+                if len(taken_levels) >= len(TRADING_CONFIG['profit_take_levels']):
+                    logger.info(f"   ✅ {symbol}: All profit levels taken - position should be fully closed")
+                    # Verify position is actually closed on Binance
+                    remaining_pos = self.trader.get_position_info(symbol)
+                    if remaining_pos and not remaining_pos['is_open']:
+                        if db_position['status'] != 'closed':
+                            self.db.update_position_status(
+                                db_position['id'],
+                                'closed',
+                                profit_pct,
+                                'All profit levels taken and verified closed on Binance'
+                            )
+                
+            except Exception as e:
+                logger.error(f"Error monitoring profit for {binance_pos['symbol']}: {e}")
+    
+    def _get_taken_profit_levels(self, db_position):
+        """Get list of profit levels already taken for a position"""
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute('''
+                SELECT details FROM trading_actions 
+                WHERE symbol = ? AND action_type = 'AUTO_PROFIT_TAKE' AND success = 1
+                ORDER BY timestamp
+            ''', (db_position['symbol'],))
+            
+            results = cursor.fetchall()
+            taken_levels = []
+            
+            for (details,) in results:
+                # Extract target profit from details string
+                import re
+                match = re.search(r'target: (\d+)%', details)
+                if match:
+                    taken_levels.append(int(match.group(1)))
+            
+            return taken_levels
+        except Exception as e:
+            logger.error(f"Error getting taken profit levels: {e}")
+            return []
+    
+    def _mark_profit_level_taken(self, position_id, profit_level):
+        """Mark a profit level as taken (stored in trading_actions table)"""
+        # This is already logged in trading_actions by log_trading_action call
+        pass
     
     async def fetch_messages(self):
         messages = []
@@ -1056,11 +1308,12 @@ Position remains open. Continuing to monitor.
         logger.info("="*80)
     
     async def position_sync_loop(self):
-        """Background task to sync positions"""
+        """Background task to sync positions and monitor for profit taking"""
         while True:
             try:
                 await self.sync_positions_with_binance()
                 await self.manage_trailing_stops()
+                await self.monitor_and_take_profits()  # New: Auto profit taking
             except Exception as e:
                 logger.error(f"Error in position sync loop: {e}")
             
@@ -1079,8 +1332,16 @@ Position remains open. Continuing to monitor.
         print(f"🔄 Position Sync: Every {TRADING_CONFIG['position_sync_interval']} seconds")
         print(f"💰 Risk per trade: {TRADING_CONFIG['risk_percentage']}%")
         print(f"📊 Leverage: {TRADING_CONFIG['leverage']}x")
-        print(f"🛡️ Max Positions: {TRADING_CONFIG['max_open_positions']}")
+        print(f"🛡️ Max Positions: {TRADING_CONFIG['max_open_positions']} (tracked from Binance)")
         print(f"📈 Trailing Stop: {'Enabled' if TRADING_CONFIG['trailing_stop_enabled'] else 'Disabled'}")
+        print(f"💎 Auto Profit Taking: {'Enabled' if TRADING_CONFIG['auto_profit_taking_enabled'] else 'Disabled'}")
+        if TRADING_CONFIG['auto_profit_taking_enabled']:
+            print(f"   ⏰ ONLY for positions >3 days old ({TRADING_CONFIG['auto_profit_age_threshold_hours']}h)")
+            print(f"   📱 New positions (<3 days): Telegram signals ONLY")
+            levels = ', '.join([f"{level['profit_pct']}%" for level in TRADING_CONFIG['profit_take_levels']])
+            print(f"   📊 Profit Levels: {levels}")
+            print(f"   📈 25%→Close 25% | 50%→Close 50% total | 75%→Close 75% total | 100%+→Close 100%")
+            print(f"   🎯 Catches missed levels: If at 84%, closes 25%+25%+25%+25%=100% at once")
         print("="*80 + "\n")
         
         # Start position sync loop in background
