@@ -1,59 +1,29 @@
-import asyncio
 from telethon import TelegramClient
-from datetime import datetime, timezone, timedelta
-import re
+import asyncio
 
-# Telegram API credentials
-api_id = 29426913
-api_hash = 'bcacac7acdc7ddcf2fb95e2a34ac4b97'
-phone = '+94781440205'
+# Replace with your own credentials from https://my.telegram.org
+api_id = 23008284       # your API ID
+api_hash = '9b753f6de26369ddff1f498ce4d21fb5'  # your API hash
+phone = '+94781440205'       # your phone number (with country code)
 
-client = TelegramClient('search_session', api_id, api_hash)
+# Replace with your group and topic IDs
+group_id = -1002039861131   # example group ID (must be negative for supergroups)
+topic_id = 40011             # the topic/thread ID in the group
 
-async def search_specific_signals():
-    await client.start(phone)
-    print("Connected to Telegram")
+async def main():
+    # Initialize the client
+    client = TelegramClient('session_name', api_id, api_hash)
+    await client.start(phone=phone)
+
+    print(f"Fetching messages from group {group_id}, topic {topic_id}...")
     
-    # Get the group
-    group = await client.get_entity(-1002039861131)
-    
-    # Today's date range (UTC)
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow = today + timedelta(days=1)
-    
-    print(f"Searching for PYTH and XPL signals from {today} to {tomorrow}")
-    
-    async for message in client.iter_messages(group, offset_date=tomorrow, reverse=True):
-        if message.date < today:
-            break
-            
-        # Extract text from message using multiple methods
-        message_text = ""
-        try:
-            if hasattr(message, 'text') and message.text:
-                message_text = message.text
-            elif hasattr(message, 'caption') and message.caption:
-                message_text = message.caption
-            elif hasattr(message, 'message') and message.message:
-                message_text = message.message
-            elif hasattr(message, 'media') and message.media and hasattr(message.media, 'caption'):
-                message_text = message.media.caption or ""
-        except:
-            continue
-            
-        if message_text and ('PYTH' in message_text.upper() or 'XPL' in message_text.upper()):
-            print(f"\n=== Found Signal ===")
-            print(f"Time: {message.date}")
-            print(f"Topic ID: {getattr(message, 'reply_to', {}).get('reply_to_top_id', 'N/A')}")
-            print(f"Message: {message_text[:200]}...")
-            
-            # Check for trading signal pattern
-            if 'LONG' in message_text or 'SHORT' in message_text:
-                print("This appears to be a TRADING SIGNAL")
-            else:
-                print("This appears to be other content")
-    
+    # Iterate over messages in the topic
+    async for message in client.iter_messages(group_id, reply_to=topic_id, limit=100):
+        sender = await message.get_sender()
+        sender_name = sender.first_name if sender else "Unknown"
+        print(f"[{message.date}] {sender_name}: {message.text}")
+
     await client.disconnect()
 
-if __name__ == "__main__":
-    asyncio.run(search_specific_signals())
+if __name__ == '__main__':
+    asyncio.run(main())
