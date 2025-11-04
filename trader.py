@@ -140,6 +140,17 @@ class MessageDatabase:
             )
         ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS weekly_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start TIMESTAMP NOT NULL,
+                week_end TIMESTAMP NOT NULL,
+                report_sent_at TIMESTAMP NOT NULL,
+                total_messages INTEGER,
+                total_actions INTEGER
+            )
+        ''')
+        
         self.conn.commit()
     
     def save_message(self, message_id, text, message_date):
@@ -269,6 +280,63 @@ class MessageDatabase:
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (action_type, symbol, details, success, error_msg, datetime.now(timezone.utc)))
         self.conn.commit()
+    
+    def get_weekly_activity(self, start_date, end_date):
+        """Get all messages and actions taken during a week"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT 
+                m.message_id,
+                m.message_text,
+                m.message_date,
+                m.message_type,
+                m.ai_analysis,
+                m.processed
+            FROM messages m
+            WHERE m.message_date >= ? AND m.message_date < ?
+            ORDER BY m.message_date ASC
+        ''', (start_date, end_date))
+        
+        columns = [desc[0] for desc in cursor.description]
+        messages = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        # Get actions taken during the week
+        cursor.execute('''
+            SELECT 
+                action_type,
+                symbol,
+                details,
+                success,
+                timestamp
+            FROM trading_actions
+            WHERE timestamp >= ? AND timestamp < ?
+            ORDER BY timestamp ASC
+        ''', (start_date, end_date))
+        
+        columns = [desc[0] for desc in cursor.description]
+        actions = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        return messages, actions
+    
+    def mark_weekly_report_sent(self, week_start, week_end, total_messages, total_actions):
+        """Mark that a weekly report has been sent"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO weekly_reports 
+            (week_start, week_end, report_sent_at, total_messages, total_actions)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (week_start, week_end, datetime.now(timezone.utc), total_messages, total_actions))
+        self.conn.commit()
+    
+    def get_last_weekly_report_date(self):
+        """Get the date of the last weekly report sent"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT week_end FROM weekly_reports 
+            ORDER BY week_end DESC LIMIT 1
+        ''')
+        result = cursor.fetchone()
+        return result[0] if result else None
 
 class AISignalExtractor:
     def __init__(self, api_key, base_url, model):
@@ -708,6 +776,177 @@ class ImprovedAITradingBot:
             logger.info(f"📧 Email sent: {subject}")
         except Exception as e:
             logger.error(f"Failed to send email: {e}")
+    
+    def send_weekly_report(self):
+        """Generate and send weekly activity report"""
+        try:
+            # Get current week boundaries (Monday to Sunday)
+            now = datetime.now(timezone.utc)
+            
+            # Check if we should send report (only on Mondays)
+            if now.weekday() != 0:  # 0 = Monday
+                return
+            
+            # Calculate last week's date range
+            last_monday = now - timedelta(days=7)
+            last_sunday = now - timedelta(days=1)
+            
+            # Set to start/end of day
+            week_start = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_end = last_sunday.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+            # Check if report already sent for this week
+            last_report_date = self.db.get_last_weekly_report_date()
+            if last_report_date:
+                last_report_dt = datetime.fromisoformat(last_report_date.replace('Z', '+00:00')) if isinstance(last_report_date, str) else last_report_date
+                if last_report_dt >= week_start:
+                    logger.info("📊 Weekly report already sent for this week")
+                    return
+            
+            # Get weekly activity
+            messages, actions = self.db.get_weekly_activity(week_start, week_end)
+            
+            if not messages and not actions:
+                logger.info("📊 No activity to report this week")
+                return
+            
+            # Categorize actions
+            action_summary = {
+                'OPEN_POSITION': 0,
+                'CLOSE_FULL': 0,
+                'CLOSE_PARTIAL': 0,
+                'IGNORE': 0
+            }
+            
+            action_details = {
+                'OPEN_POSITION': [],
+                'CLOSE_FULL': [],
+                'CLOSE_PARTIAL': [],
+                'IGNORE': []
+            }
+            
+            # Process messages
+            for msg in messages:
+                msg_type = msg.get('message_type', 'IGNORE')
+                
+                if msg_type == 'NEW_POSITION':
+                    category = 'OPEN_POSITION'
+                elif msg_type == 'POSITION_UPDATE':
+                    # Check AI analysis for action type
+                    try:
+                        ai_data = json.loads(msg.get('ai_analysis', '{}'))
+                        action = ai_data.get('update', {}).get('action', 'IGNORE')
+                        if action in ['CLOSE_FULL', 'HOLD']:  # HOLD is now CLOSE_FULL
+                            category = 'CLOSE_FULL'
+                        elif action == 'CLOSE_PARTIAL':
+                            category = 'CLOSE_PARTIAL'
+                        else:
+                            category = 'IGNORE'
+                    except:
+                        category = 'IGNORE'
+                else:
+                    category = 'IGNORE'
+                
+                action_summary[category] += 1
+                
+                # Add to details
+                msg_preview = msg['message_text'][:100] + ('...' if len(msg['message_text']) > 100 else '')
+                msg_date = msg['message_date']
+                if isinstance(msg_date, str):
+                    msg_date = datetime.fromisoformat(msg_date.replace('Z', '+00:00'))
+                
+                action_details[category].append({
+                    'date': msg_date.strftime('%Y-%m-%d %H:%M UTC'),
+                    'message': msg_preview,
+                    'symbol': self._extract_symbol_from_message(msg['message_text'])
+                })
+            
+            # Build report
+            report = f"""
+📊 <b>WEEKLY TRADING ACTIVITY REPORT</b>
+
+<b>Report Period:</b> {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}
+<b>Generated:</b> {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+{'='*60}
+
+<b>📈 SUMMARY</b>
+
+<b>Total Messages Detected:</b> {len(messages)}
+<b>Total Actions Taken:</b> {sum(action_summary.values())}
+
+<b>Action Breakdown:</b>
+  🟢 Opened Positions: {action_summary['OPEN_POSITION']}
+  🔴 Closed Fully: {action_summary['CLOSE_FULL']}
+  🟡 Closed Partially: {action_summary['CLOSE_PARTIAL']}
+  ⚪ Ignored: {action_summary['IGNORE']}
+
+{'='*60}
+
+<b>🟢 OPENED POSITIONS ({action_summary['OPEN_POSITION']})</b>
+"""
+            
+            if action_details['OPEN_POSITION']:
+                for detail in action_details['OPEN_POSITION']:
+                    report += f"\n• [{detail['date']}] {detail['symbol']}\n  Message: {detail['message']}\n"
+            else:
+                report += "\n  No positions opened this week.\n"
+            
+            report += f"\n{'='*60}\n\n<b>🔴 CLOSED FULLY ({action_summary['CLOSE_FULL']})</b>\n"
+            
+            if action_details['CLOSE_FULL']:
+                for detail in action_details['CLOSE_FULL']:
+                    report += f"\n• [{detail['date']}] {detail['symbol']}\n  Message: {detail['message']}\n"
+            else:
+                report += "\n  No positions fully closed this week.\n"
+            
+            report += f"\n{'='*60}\n\n<b>🟡 CLOSED PARTIALLY ({action_summary['CLOSE_PARTIAL']})</b>\n"
+            
+            if action_details['CLOSE_PARTIAL']:
+                for detail in action_details['CLOSE_PARTIAL']:
+                    report += f"\n• [{detail['date']}] {detail['symbol']}\n  Message: {detail['message']}\n"
+            else:
+                report += "\n  No positions partially closed this week.\n"
+            
+            report += f"\n{'='*60}\n\n<b>⚪ IGNORED MESSAGES ({action_summary['IGNORE']})</b>\n"
+            
+            if action_details['IGNORE']:
+                for detail in action_details['IGNORE'][:10]:  # Limit to first 10
+                    report += f"\n• [{detail['date']}]\n  Message: {detail['message']}\n"
+                if len(action_details['IGNORE']) > 10:
+                    report += f"\n  ... and {len(action_details['IGNORE']) - 10} more ignored messages.\n"
+            else:
+                report += "\n  No messages ignored this week.\n"
+            
+            report += f"\n{'='*60}\n\n"
+            report += "🤖 This is an automated weekly report from your AI Trading Bot.\n"
+            
+            # Send email
+            self.send_email_notification(
+                f"📊 Weekly Trading Report - Week of {week_start.strftime('%b %d, %Y')}",
+                report
+            )
+            
+            # Mark report as sent
+            self.db.mark_weekly_report_sent(week_start, week_end, len(messages), sum(action_summary.values()))
+            
+            logger.info(f"📊 Weekly report sent for week {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate/send weekly report: {e}")
+    
+    def _extract_symbol_from_message(self, message_text):
+        """Try to extract symbol from message text"""
+        try:
+            # Common patterns: $SYMBOL, SYMBOL, SYMBOLUSDT
+            import re
+            # Look for uppercase words that might be symbols
+            matches = re.findall(r'\b[A-Z]{2,10}(?:USDT)?\b', message_text)
+            if matches:
+                return matches[0]
+            return 'N/A'
+        except:
+            return 'N/A'
     
     def can_open_new_position(self):
         """Check if we can open a new position based on risk limits - using BINANCE data"""
@@ -1230,23 +1469,32 @@ class ImprovedAITradingBot:
                 logger.info(f"✅ Partial close: {symbol} - {partial_pct}%")
         
         elif action == 'HOLD':
+            # AI suggested HOLD, but we close instead
             if position:
-                logger.info(f"💎 Holding {symbol} - AI Decision: {reasoning}")
-                self.db.log_trading_action('HOLD', symbol, f"Profit: {profit_pct}% | Reasoning: {reasoning}", True)
-                
-                notification = f"""
-💎 <b>AI DECISION: HOLD POSITION</b>
+                logger.info(f"� AI suggested HOLD for {symbol}, closing instead - Reasoning: {reasoning}")
+                success = self.trader.close_position(symbol)
+                if success:
+                    self.db.update_position_status(position['id'], 'closed', profit_pct, f'AI Hold→Close: {reasoning}')
+                    self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {profit_pct}% | AI suggested HOLD but closed instead | Reasoning: {reasoning}", True)
+                    
+                    profit_emoji = "🟢" if profit_pct and profit_pct > 0 else "🔴"
+                    status = 'WIN' if profit_pct and profit_pct > 0 else 'LOSS'
+                    notification = f"""
+{profit_emoji} <b>POSITION CLOSED (AI SUGGESTED HOLD)</b>
 
 <b>Symbol:</b> {symbol}
-<b>Current Profit:</b> {profit_pct:+.2f}%
+<b>Profit:</b> {profit_pct:+.2f}% {f'({status})' if profit_pct else ''}
+<b>Original AI Action:</b> HOLD
+<b>Actual Action:</b> Full Close
 <b>AI Confidence:</b> {confidence}%
-<b>Reasoning:</b> {reasoning}
+<b>AI Reasoning:</b> {reasoning}
 
-Position remains open. Continuing to monitor.
+Position closed instead of holding per configuration.
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 """
-                self.send_email_notification(f"💎 AI Holds - {symbol}", notification)
+                    self.send_email_notification(f"{profit_emoji} AI Hold→Closed - {symbol} ({status})", notification)
+                    logger.info(f"✅ Position closed (was HOLD): {symbol} with {profit_pct}% profit")
         
         elif action == 'CANCELLED':
             if position:
@@ -1314,6 +1562,10 @@ Position remains open. Continuing to monitor.
                 await self.sync_positions_with_binance()
                 await self.manage_trailing_stops()
                 await self.monitor_and_take_profits()  # New: Auto profit taking
+                
+                # Check if we need to send weekly report (only on Mondays)
+                self.send_weekly_report()
+                
             except Exception as e:
                 logger.error(f"Error in position sync loop: {e}")
             
