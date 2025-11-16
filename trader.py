@@ -378,28 +378,34 @@ For NON-TRADING messages:
 }
 
 INTELLIGENT DECISION RULES:
-1. Symbols: uppercase without $ sign, append USDT (e.g., "ZORAUSDT")
-2. Profit updates: Analyze context to decide action:
+1. CRITICAL: IGNORE ALL SHORT POSITIONS - Only process LONG positions
+   - If message contains "SHORT", "short", "SELL", or indicates short position: return IGNORE type
+   - Only process messages that are LONG positions or position updates
+2. Symbols: uppercase without $ sign, append USDT (e.g., "ZORAUSDT")
+3. Profit updates: Analyze context to decide action:
    - High profit (>30%): Consider CLOSE_PARTIAL (50-75%) to secure gains
    - Medium profit (15-30%): Usually HOLD but watch for risk signals
    - Low profit (<15%): Usually HOLD unless message indicates problems
    - Negative/small profit with warning signs: Consider CLOSE_FULL
-3. Messages with "cancel", "cancelled", "missed": action "CANCELLED"
-4. Risk indicators (e.g., "consolidating", "resistance", "risky", "overbought"): 
+4. Messages with "cancel", "cancelled", "missed": action "CANCELLED"
+5. Risk indicators (e.g., "consolidating", "resistance", "risky", "overbought"): 
    - If profit >20%: Suggest CLOSE_PARTIAL
    - If profit <10%: Suggest CLOSE_FULL
-5. Positive momentum (e.g., "breaking out", "strong support", "bullish"): HOLD
-6. Set confidence level (0-100) based on message clarity
-7. Provide brief reasoning for your decision
-8. Only return NEW_POSITION if message contains entry, SL, or TP prices
-9. Return valid JSON only, no markdown
+6. Positive momentum (e.g., "breaking out", "strong support", "bullish"): HOLD
+7. Set confidence level (0-100) based on message clarity
+8. Provide brief reasoning for your decision
+9. Only return NEW_POSITION if message contains entry, SL, or TP prices AND is a LONG position
+10. Return valid JSON only, no markdown
 
 EXAMPLES:
+- "BTC LONG Entry: $68,500" → NEW_POSITION (process it)
+- "ETH SHORT Entry: $3,400" → IGNORE (SHORT position, ignore completely)
 - "BTC +45% profit" → CLOSE_PARTIAL (60-70%), high profit taking
 - "ETH +25% consolidating" → CLOSE_PARTIAL (50%), profit + risk signal
 - "SOL +18% strong momentum" → HOLD, profit with bullish signal
 - "DOGE +8% facing resistance" → CLOSE_FULL, low profit + warning
-- "ADA +40% breaking ATH" → HOLD or CLOSE_PARTIAL (30%), momentum vs profit"""
+- "ADA +40% breaking ATH" → HOLD or CLOSE_PARTIAL (30%), momentum vs profit
+- "XRP SHORT at $2.50" → IGNORE (any SHORT signal must be ignored)"""
 
         user_prompt = f"Analyze this trading message:\n\n{message_text}"
         
