@@ -36,7 +36,7 @@ BINANCE_CONFIG = {
 TRADING_CONFIG = {
     'leverage': 10,
     'risk_percentage': 10,
-    'fetch_interval': 300,  # 5 minutes
+    'fetch_interval': 60,  # 1 minute
     'lookback_hours': 24,
     'max_open_positions': 5,  # Maximum 5 positions at once
     'max_total_risk': 50,  # Maximum 50% of account at risk
@@ -105,23 +105,19 @@ class MessageDatabase:
                 close_reason TEXT,
                 source_message_id INTEGER,
                 binance_order_id TEXT,
-                last_synced_at TIMESTAMP
+                last_synced_at TIMESTAMP,
+                monitor_profit BOOLEAN DEFAULT 0
             )
         ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS position_updates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                position_id INTEGER NOT NULL,
-                update_type TEXT NOT NULL,
-                old_value REAL,
-                new_value REAL,
-                profit_percentage REAL,
-                note TEXT,
-                updated_at TIMESTAMP NOT NULL,
-                FOREIGN KEY (position_id) REFERENCES positions (id)
-            )
-        ''')
+
+        # Schema migration for existing databases
+        try:
+            cursor.execute('ALTER TABLE positions ADD COLUMN monitor_profit BOOLEAN DEFAULT 0')
+            self.conn.commit()
+            logger.info("✅ Added monitor_profit column to positions table")
+        except sqlite3.OperationalError:
+            # Column likely already exists
+            pass
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trading_actions (
@@ -143,6 +139,19 @@ class MessageDatabase:
                 report_sent_at TIMESTAMP NOT NULL,
                 total_messages INTEGER,
                 total_actions INTEGER
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS position_updates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER,
+                update_type TEXT NOT NULL,
+                old_value REAL,
+                new_value REAL,
+                note TEXT,
+                updated_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (position_id) REFERENCES positions (id)
             )
         ''')
         
@@ -266,6 +275,15 @@ class MessageDatabase:
             WHERE id = ?
         ''', (price, datetime.now(timezone.utc), position_id))
         self.conn.commit()
+
+    def update_position_monitoring(self, position_id, monitor_profit):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE positions 
+            SET monitor_profit = ?
+            WHERE id = ?
+        ''', (monitor_profit, position_id))
+        self.conn.commit()
     
     def log_trading_action(self, action_type, symbol, details, success, error_msg=None):
         cursor = self.conn.cursor()
@@ -275,7 +293,7 @@ class MessageDatabase:
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (action_type, symbol, details, success, error_msg, datetime.now(timezone.utc)))
         self.conn.commit()
-    
+
     def get_weekly_activity(self, start_date, end_date):
         """Get all messages and actions taken during a week"""
         cursor = self.conn.cursor()
@@ -967,7 +985,7 @@ class ImprovedAITradingBot:
             return False
         
         return True
-    
+
     async def sync_positions_with_binance(self):
         """CRITICAL: Sync database positions with actual Binance positions"""
         open_positions = self.db.get_all_open_positions()
@@ -1136,6 +1154,41 @@ class ImprovedAITradingBot:
                     logger.warning(f"   ⚠️ {symbol} on Binance but not in DB - syncing")
                     continue
                 
+                # Check if this position is being monitored for profit discrepancy
+                is_monitored = db_position.get('monitor_profit', 0)
+                
+                if is_monitored:
+                    logger.info(f"   👀 {symbol}: Monitored for profit discrepancy. Current profit: {profit_pct:.2f}%")
+                    
+                    if profit_pct >= 20:
+                        logger.info(f"🎯 {symbol}: Monitored position reached 20% profit - closing")
+                        success = self.trader.close_position(symbol)
+                        
+                        if success:
+                            self.db.update_position_status(db_position['id'], 'closed', profit_pct, 'Auto-closed monitored position (>20%)')
+                            self.db.log_trading_action('AUTO_CLOSE_MONITORED', symbol, f"Closed monitored position at {profit_pct:.2f}% profit", True)
+                            
+                            notification = f"""
+💰🎯 <b>MONITORED POSITION CLOSED</b>
+
+<b>Symbol:</b> {symbol}
+<b>Profit:</b> {profit_pct:.2f}%
+<b>Reason:</b> Reached 20% profit target after holding.
+<b>Action:</b> Full Close
+
+🤖 Auto-closed monitored position
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                            self.send_email_notification(f"💰 Monitored Closed - {symbol} ({profit_pct:.1f}%)", notification)
+                            logger.info(f"✅ Monitored position closed: {symbol} at {profit_pct:.2f}% profit")
+                        else:
+                            logger.error(f"❌ Failed to close monitored position {symbol}")
+                    else:
+                        logger.info(f"   ⏳ {symbol}: Monitored profit {profit_pct:.2f}% < 20% - continuing to hold")
+                    
+                    # Skip normal age-based check for monitored positions
+                    continue
+
                 # Check position age - convert opened_at string to datetime if needed
                 opened_at = db_position['opened_at']
                 if isinstance(opened_at, str):
@@ -1215,8 +1268,6 @@ class ImprovedAITradingBot:
                 
             except Exception as e:
                 logger.error(f"Error monitoring profit for {binance_pos['symbol']}: {e}")
-    
-
     
     async def fetch_messages(self):
         messages = []
@@ -1329,38 +1380,80 @@ class ImprovedAITradingBot:
         
         position = self.db.get_open_position(symbol)
         
-        if not position and action not in ['CANCELLED', 'INFO']:
-            logger.warning(f"⚠️ No open position found for {symbol}")
-            self.db.log_trading_action('UPDATE_POSITION', symbol, 'No position found', False)
-            return
-        
         if action == 'CLOSE_FULL':
-            success = self.trader.close_position(symbol)
-            if success and position:
-                self.db.update_position_status(position['id'], 'closed', profit_pct, f'AI Decision: {reasoning}')
-                self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {profit_pct}% | Reasoning: {reasoning}", True)
-                
-                profit_emoji = "🟢" if profit_pct and profit_pct > 0 else "🔴"
-                status = 'WIN' if profit_pct and profit_pct > 0 else 'LOSS'
-                notification = f"""
+            # Verify profit with Binance before closing
+            binance_pos = self.trader.get_position_info(symbol)
+            real_profit_pct = 0
+            current_price = 0
+            
+            if binance_pos and binance_pos['is_open']:
+                entry = binance_pos['entry_price']
+                current_price = self.trader.get_current_price(symbol)
+                if entry > 0 and current_price:
+                    real_profit_pct = ((current_price - entry) / entry) * 100
+            
+            # Check for discrepancy
+            should_close = True
+            discrepancy_reason = ""
+            
+            if profit_pct and profit_pct > 5:
+                # If real profit is significantly lower (less than 70% of claimed profit) or negative
+                if real_profit_pct < (profit_pct * 0.7) or real_profit_pct < 0:
+                    should_close = False
+                    discrepancy_reason = f"Signal claimed {profit_pct}%, but real profit is {real_profit_pct:.2f}%"
+                    logger.warning(f"⚠️ Profit discrepancy for {symbol}: {discrepancy_reason}")
+
+            if should_close:
+                success = self.trader.close_position(symbol)
+                if success and position:
+                    # Use real profit for records if available, otherwise signal profit
+                    final_profit = real_profit_pct if real_profit_pct != 0 else profit_pct
+                    
+                    self.db.update_position_status(position['id'], 'closed', final_profit, f'AI Decision: {reasoning}')
+                    self.db.log_trading_action('CLOSE_FULL', symbol, f"Profit: {final_profit:.2f}% | Reasoning: {reasoning}", True)
+                    
+                    profit_emoji = "🟢" if final_profit and final_profit > 0 else "🔴"
+                    status = 'WIN' if final_profit and final_profit > 0 else 'LOSS'
+                    notification = f"""
 {profit_emoji} <b>POSITION CLOSED BY AI</b>
 
 <b>Symbol:</b> {symbol}
-<b>Profit:</b> {profit_pct:+.2f}% {f'({status})' if profit_pct else ''}
+<b>Real Profit:</b> {final_profit:+.2f}% {f'({status})' if final_profit else ''}
+<b>Signal Profit:</b> {profit_pct:+.2f}%
 <b>Action:</b> Full Close
 <b>AI Confidence:</b> {confidence}%
 <b>Reasoning:</b> {reasoning}
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 """
-                self.send_email_notification(f"{profit_emoji} AI Closed - {symbol} ({status})", notification)
-                logger.info(f"✅ Position closed: {symbol} with {profit_pct}% profit")
-        
+                    self.send_email_notification(f"{profit_emoji} AI Closed - {symbol} ({status})", notification)
+                    logger.info(f"✅ Position closed: {symbol} with {final_profit:.2f}% profit")
+            else:
+                # Hold and monitor
+                if position:
+                    self.db.update_position_monitoring(position['id'], 1)
+                    self.db.log_trading_action('HOLD_DISCREPANCY', symbol, f"{discrepancy_reason} - Holding for monitoring", True)
+                    
+                    notification = f"""
+⚠️ <b>POSITION HELD (PROFIT DISCREPANCY)</b>
+
+<b>Symbol:</b> {symbol}
+<b>Signal Profit:</b> {profit_pct:+.2f}%
+<b>Real Profit:</b> {real_profit_pct:+.2f}%
+<b>Action:</b> Holding & Monitoring
+<b>Reason:</b> Real profit is significantly lower than signal profit.
+<b>Plan:</b> Will auto-close when real profit > 20%.
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                    self.send_email_notification(f"⚠️ Holding - {symbol} (Profit Discrepancy)", notification)
+                    logger.info(f"⏸️ Holding {symbol} due to profit discrepancy. Monitoring enabled.")
+
         elif action == 'CLOSE_PARTIAL':
             partial_pct = update_info['update'].get('partial_close_pct', 50)
             success = self.trader.close_position(symbol, partial_pct)
-            if success and position:
-                self.db.log_trading_action('CLOSE_PARTIAL', symbol, f"Closed {partial_pct}% | Reasoning: {reasoning}", True)
+            if success:
+                self.db.log_trading_action('CLOSE_PARTIAL', symbol, f"Closed {partial_pct}% | Profit: {profit_pct}% | Reasoning: {reasoning}", True)
                 
                 notification = f"""
 🟡 <b>PARTIAL CLOSE BY AI</b>
@@ -1379,7 +1472,7 @@ class ImprovedAITradingBot:
         elif action == 'HOLD':
             # AI suggested HOLD, but we close instead
             if position:
-                logger.info(f"� AI suggested HOLD for {symbol}, closing instead - Reasoning: {reasoning}")
+                logger.info(f" AI suggested HOLD for {symbol}, closing instead - Reasoning: {reasoning}")
                 success = self.trader.close_position(symbol)
                 if success:
                     self.db.update_position_status(position['id'], 'closed', profit_pct, f'AI Hold→Close: {reasoning}')
