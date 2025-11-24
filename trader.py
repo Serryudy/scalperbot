@@ -24,7 +24,7 @@ TELEGRAM_CONFIG = {
     'api_id': 23008284,
     'api_hash': '9b753f6de26369ddff1f498ce4d21fb5',
     'phone': '+94781440205',
-    'group_id': -1001573488012,
+    'group_id': -1002529586843,
     #'topic_id': 40011
 }
 
