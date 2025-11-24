@@ -40,6 +40,7 @@ TRADING_CONFIG = {
     'lookback_hours': 24,
     'max_open_positions': 5,  # Maximum 5 positions at once
     'max_total_risk': 50,  # Maximum 50% of account at risk
+    'max_price_deviation_pct': 2,  # Maximum 2% price deviation (LONG: upper bound only, SHORT: lower bound only)
     'trailing_stop_enabled': True,
     'trailing_stop_activation': 20,  # Activate at 20% profit
     'trailing_stop_distance': 10,  # Trail 10% below peak
@@ -650,6 +651,36 @@ class BinanceTrader:
             entry = signal['entry_price']
             sl = signal['stop_loss']
             tp = signal.get('take_profit')
+            
+            # Check market price deviation BEFORE placing order
+            current_price = self.get_current_price(symbol)
+            if current_price is None:
+                logger.error(f"❌ Unable to get current market price for {symbol}")
+                return None
+            
+            # For LONG positions: Only check upper bound (can't buy too high)
+            # Market price can be lower than entry (better for us), but not higher than entry + deviation%
+            max_allowed_price = entry * (1 + TRADING_CONFIG['max_price_deviation_pct'] / 100)
+            deviation_pct = ((current_price - entry) / entry) * 100
+            
+            if current_price > max_allowed_price:
+                logger.warning(f"⚠️ PRICE DEVIATION CHECK FAILED for {symbol}")
+                logger.warning(f"   Signal Entry Price: ${entry:.4f}")
+                logger.warning(f"   Current Market Price: ${current_price:.4f}")
+                logger.warning(f"   Deviation: +{deviation_pct:.2f}% (Max allowed: +{TRADING_CONFIG['max_price_deviation_pct']}%)")
+                logger.warning(f"   Max Allowed Price: ${max_allowed_price:.4f}")
+                logger.warning(f"   ❌ Order SKIPPED - Market price too high")
+                return {
+                    'error': 'price_deviation',
+                    'symbol': symbol,
+                    'entry_price': entry,
+                    'current_price': current_price,
+                    'deviation_pct': deviation_pct,
+                    'max_allowed_pct': TRADING_CONFIG['max_price_deviation_pct']
+                }
+            
+            logger.info(f"✅ Price check passed for {symbol}")
+            logger.info(f"   Signal Entry: ${entry:.4f} | Market Price: ${current_price:.4f} | Deviation: {deviation_pct:+.2f}%")
             
             if not self.set_leverage(symbol, leverage):
                 return None
@@ -1319,7 +1350,44 @@ class ImprovedAITradingBot:
             TRADING_CONFIG['risk_percentage']
         )
         
-        if result:
+        # Check if order was skipped due to price deviation
+        if result and result.get('error') == 'price_deviation':
+            deviation_msg = f"""
+⚠️ <b>ORDER SKIPPED - PRICE DEVIATION</b>
+
+<b>Symbol:</b> {result['symbol']}
+<b>Signal Entry Price:</b> ${result['entry_price']:.4f}
+<b>Current Market Price:</b> ${result['current_price']:.4f}
+<b>Price Deviation:</b> {result['deviation_pct']:+.2f}%
+<b>Max Allowed Deviation:</b> +{result['max_allowed_pct']}%
+
+<b>Reason:</b> Market price is too high compared to signal entry price.
+For LONG positions, we only buy if price hasn't moved up more than {result['max_allowed_pct']}% from entry.
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+            
+            self.db.log_trading_action(
+                'SKIP_PRICE_DEVIATION',
+                result['symbol'],
+                json.dumps({
+                    'entry_price': result['entry_price'],
+                    'current_price': result['current_price'],
+                    'deviation_pct': result['deviation_pct'],
+                    'max_allowed_pct': result['max_allowed_pct']
+                }),
+                False,
+                f"Price deviation {result['deviation_pct']:.2f}% exceeds limit {result['max_allowed_pct']}%"
+            )
+            
+            self.send_email_notification(
+                f"⚠️ Order Skipped - Price Deviation - {result['symbol']}",
+                deviation_msg
+            )
+            logger.warning(f"⚠️ Order skipped due to price deviation: {result['symbol']}")
+            return
+        
+        if result and 'order_id' in result:
             self.db.save_position(
                 symbol=result['symbol'],
                 entry=result['entry'],
