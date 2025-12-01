@@ -24,7 +24,7 @@ TELEGRAM_CONFIG = {
     'api_id': 23008284,
     'api_hash': '9b753f6de26369ddff1f498ce4d21fb5',
     'phone': '+94781440205',
-    'group_id': -1002529586843,
+    'group_ids': [-1002529586843, -1001573488012],  # Multiple groups to monitor
     #'topic_id': 40011
 }
 
@@ -1372,21 +1372,24 @@ class ImprovedAITradingBot:
         messages = []
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=TRADING_CONFIG['lookback_hours'])
         
-        async for message in self.telegram_client.iter_messages(
-            TELEGRAM_CONFIG['group_id'],
-            #reply_to=TELEGRAM_CONFIG['topic_id'],
-            limit=None
-        ):
-            if message.date < cutoff_time:
-                break
-            
-            if message.text:
-                self.db.save_message(message.id, message.text, message.date)
-                messages.append({
-                    'id': message.id,
-                    'text': message.text,
-                    'date': message.date
-                })
+        # Fetch messages from all configured groups
+        for group_id in TELEGRAM_CONFIG['group_ids']:
+            logger.info(f"📥 Fetching messages from group {group_id}...")
+            async for message in self.telegram_client.iter_messages(
+                group_id,
+                #reply_to=TELEGRAM_CONFIG['topic_id'],
+                limit=None
+            ):
+                if message.date < cutoff_time:
+                    break
+                
+                if message.text:
+                    self.db.save_message(message.id, message.text, message.date)
+                    messages.append({
+                        'id': message.id,
+                        'text': message.text,
+                        'date': message.date
+                    })
         
         return messages
     
@@ -1715,7 +1718,7 @@ Position closed instead of holding per configuration.
         print("\n" + "="*80)
         print("🤖 IMPROVED AI-POWERED TRADING BOT")
         print("="*80)
-        print(f"📍 Group ID: {TELEGRAM_CONFIG['group_id']}")
+        print(f"📍 Group IDs: {TELEGRAM_CONFIG['group_ids']}")
         #print(f"📍 Topic ID: {TELEGRAM_CONFIG['topic_id']}")
         print(f"⏰ Message Check: Every {TRADING_CONFIG['fetch_interval']} seconds")
         print(f"🔄 Position Sync: Every {TRADING_CONFIG['position_sync_interval']} seconds")
