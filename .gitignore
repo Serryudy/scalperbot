@@ -20,3 +20,6 @@ __pycache__/
 # Virtual environment
 venv/
 env/
+
+# Frontend
+/frontend
