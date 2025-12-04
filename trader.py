@@ -11,6 +11,12 @@ import requests
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from trader_extensions import (
+    CREATE_MESSAGE_ACTIONS_TABLE,
+    MessageActionsDB,
+    move_sl_to_entry_method,
+    get_enhanced_ai_prompt
+)
 
 # Configure logging
 logging.basicConfig(
@@ -156,6 +162,8 @@ class MessageDatabase:
             )
         ''')
         
+        
+        cursor.execute(CREATE_MESSAGE_ACTIONS_TABLE)
         self.conn.commit()
     
     def save_message(self, message_id, text, message_date):
@@ -352,6 +360,12 @@ class MessageDatabase:
         result = cursor.fetchone()
         return result[0] if result else None
 
+    
+    # Message Actions Methods (from trader_extensions)
+    save_message_action = MessageActionsDB.save_message_action
+    get_message_actions = MessageActionsDB.get_message_actions
+    get_closed_positions = MessageActionsDB.get_closed_positions
+
 class AISignalExtractor:
     def __init__(self, api_key, base_url, model):
         self.api_key = api_key
@@ -359,72 +373,7 @@ class AISignalExtractor:
         self.model = model
     
     def analyze_message(self, message_text):
-        system_prompt = """You are an intelligent cryptocurrency trading signal analyzer. Analyze Telegram messages and extract trading signals or position updates. Use your intelligence to make smart decisions about position management.
-
-Output MUST be valid JSON with one of these structures:
-
-For NEW POSITION signals:
-{
-    "type": "NEW_POSITION",
-    "signal": {
-        "symbol": "SYMBOL",
-        "entry_price": float,
-        "entry_limit": float or null,
-        "stop_loss": float,
-        "take_profit": float or null,
-        "position_type": "LONG" or "SHORT"
-    }
-}
-
-For POSITION UPDATE messages:
-{
-    "type": "POSITION_UPDATE",
-    "update": {
-        "symbol": "SYMBOL",
-        "action": "CLOSE_FULL" or "CLOSE_PARTIAL" or "HOLD" or "CANCELLED" or "INFO",
-        "profit_percentage": float or null,
-        "partial_close_pct": float or null,
-        "confidence": float (0-100),
-        "reasoning": "brief explanation of decision",
-        "note": "any relevant information"
-    }
-}
-
-For NON-TRADING messages:
-{
-    "type": "IGNORE",
-    "reason": "explanation"
-}
-
-INTELLIGENT DECISION RULES:
-1. CRITICAL: IGNORE ALL SHORT POSITIONS - Only process LONG positions
-   - If message contains "SHORT", "short", "SELL", or indicates short position: return IGNORE type
-   - Only process messages that are LONG positions or position updates
-2. Symbols: uppercase without $ sign, append USDT (e.g., "ZORAUSDT")
-3. Profit updates: Analyze context to decide action:
-   - High profit (>30%): Consider CLOSE_PARTIAL (50-75%) to secure gains
-   - Medium profit (15-30%): Usually HOLD but watch for risk signals
-   - Low profit (<15%): Usually HOLD unless message indicates problems
-   - Negative/small profit with warning signs: Consider CLOSE_FULL
-4. Messages with "cancel", "cancelled", "missed": action "CANCELLED"
-5. Risk indicators (e.g., "consolidating", "resistance", "risky", "overbought"): 
-   - If profit >20%: Suggest CLOSE_PARTIAL
-   - If profit <10%: Suggest CLOSE_FULL
-6. Positive momentum (e.g., "breaking out", "strong support", "bullish"): HOLD
-7. Set confidence level (0-100) based on message clarity
-8. Provide brief reasoning for your decision
-9. Only return NEW_POSITION if message contains entry, SL, or TP prices AND is a LONG position
-10. Return valid JSON only, no markdown
-
-EXAMPLES:
-- "BTC LONG Entry: $68,500" → NEW_POSITION (process it)
-- "ETH SHORT Entry: $3,400" → IGNORE (SHORT position, ignore completely)
-- "BTC +45% profit" → CLOSE_PARTIAL (60-70%), high profit taking
-- "ETH +25% consolidating" → CLOSE_PARTIAL (50%), profit + risk signal
-- "SOL +18% strong momentum" → HOLD, profit with bullish signal
-- "DOGE +8% facing resistance" → CLOSE_FULL, low profit + warning
-- "ADA +40% breaking ATH" → HOLD or CLOSE_PARTIAL (30%), momentum vs profit
-- "XRP SHORT at $2.50" → IGNORE (any SHORT signal must be ignored)"""
+        system_prompt = get_enhanced_ai_prompt()
 
         user_prompt = f"Analyze this trading message:\n\n{message_text}"
         
@@ -644,6 +593,10 @@ class BinanceTrader:
         except Exception as e:
             logger.error(f"Error modifying SL: {e}")
             return False
+    
+    
+    # Move SL to Entry Method (from trader_extensions)
+    move_sl_to_entry = move_sl_to_entry_method
     
     def open_long_position(self, signal, leverage, risk_pct):
         try:
@@ -1518,6 +1471,28 @@ For LONG positions, we only buy if price hasn't moved up more than {result['max_
         logger.info(f"   AI Reasoning: {reasoning}")
         
         position = self.db.get_open_position(symbol)
+
+        # ==== NEW: Extract partial close percentage and move SL flags ====
+        partial_close_pct = update_info['update'].get('partial_close_percentage')
+        move_sl_flag = update_info['update'].get('move_sl_to_entry', False)
+        # NEW: Handle Move SL to Entry
+        if move_sl_flag and position:
+            entry_price = position['entry_price']
+            logger.info(f"🔒 Moving SL to entry for {symbol}")
+            success = self.trader.move_sl_to_entry(symbol, entry_price)
+            if success:
+                self.db.update_position_stop_loss(position['id'], entry_price, 'SL moved to entry')
+                logger.info(f"✅ SL moved to entry: {symbol}")
+            return  # Exit after handling
+        # NEW: Handle Explicit Partial Close
+        if partial_close_pct and partial_close_pct > 0:
+            logger.info(f"📊 Partial close: {partial_close_pct}% for {symbol}")
+            success = self.trader.close_position(symbol, partial_close_pct)
+            if success:
+                self.db.log_trading_action(f'CLOSE_PARTIAL_{int(partial_close_pct)}%', 
+                    symbol, f"Closed {partial_close_pct}%", True)
+                logger.info(f"✅ Partial close: {symbol} - {partial_close_pct}%")
+            return  # Exit after handling
         
         if action == 'CLOSE_FULL':
             # Verify profit with Binance before closing
