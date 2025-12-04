@@ -238,14 +238,14 @@ class MessageDatabase:
         cursor.execute("SELECT COUNT(*) FROM positions WHERE status = 'open'")
         return cursor.fetchone()[0]
     
-    def update_position_status(self, position_id, status, profit_pct=None, close_reason=None):
+    def update_position_status(self, position_id, status, profit_pct=None, close_reason=None, exit_price=None):
         cursor = self.conn.cursor()
         if profit_pct is not None:
             cursor.execute('''
                 UPDATE positions 
-                SET status = ?, profit_percentage = ?, closed_at = ?, close_reason = ?
+                SET status = ?, profit_percentage = ?, exit_price = ?, closed_at = ?, close_reason = ?
                 WHERE id = ?
-            ''', (status, profit_pct, datetime.now(timezone.utc), close_reason, position_id))
+            ''', (status, profit_pct, exit_price, datetime.now(timezone.utc), close_reason, position_id))
         else:
             cursor.execute('''
                 UPDATE positions 
