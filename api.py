@@ -158,14 +158,30 @@ def get_position_history():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-            SELECT 
-                id, symbol, entry_price, exit_price, quantity, leverage,
-                opened_at, closed_at, profit_percentage, close_reason,
-                binance_order_id
-            FROM positions 
-            WHERE status = 'closed'
-        """
+        # Check if exit_price column exists (for backward compatibility)
+        cursor.execute("PRAGMA table_info(positions)")
+        columns = [column[1] for column in cursor.fetchall()]
+        has_exit_price = 'exit_price' in columns
+        
+        # Build query based on available columns
+        if has_exit_price:
+            query = """
+                SELECT 
+                    id, symbol, entry_price, exit_price, quantity, leverage,
+                    opened_at, closed_at, profit_percentage, close_reason,
+                    binance_order_id
+                FROM positions 
+                WHERE status = 'closed'
+            """
+        else:
+            query = """
+                SELECT 
+                    id, symbol, entry_price, quantity, leverage,
+                    opened_at, closed_at, profit_percentage, close_reason,
+                    binance_order_id
+                FROM positions 
+                WHERE status = 'closed'
+            """
         params = []
         
         if symbol:
@@ -196,7 +212,7 @@ def get_position_history():
             quantity = row['quantity']
             
             # Use actual exit_price if available (new records), otherwise calculate (old records)
-            exit_price = row.get('exit_price')
+            exit_price = row.get('exit_price') if has_exit_price else None
             if not exit_price and profit_pct and entry_price:
                 # Fallback calculation for old records without exit_price
                 exit_price = entry_price * (1 + profit_pct / 100)
