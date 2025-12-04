@@ -212,7 +212,13 @@ def get_position_history():
             quantity = row['quantity']
             
             # Use actual exit_price if available (new records), otherwise calculate (old records)
-            exit_price = row.get('exit_price') if has_exit_price else None
+            exit_price = None
+            if has_exit_price:
+                try:
+                    exit_price = row['exit_price']
+                except (KeyError, IndexError):
+                    pass
+            
             if not exit_price and profit_pct and entry_price:
                 # Fallback calculation for old records without exit_price
                 exit_price = entry_price * (1 + profit_pct / 100)
