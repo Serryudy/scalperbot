@@ -160,7 +160,7 @@ def get_position_history():
         
         query = """
             SELECT 
-                id, symbol, entry_price, quantity, leverage,
+                id, symbol, entry_price, exit_price, quantity, leverage,
                 opened_at, closed_at, profit_percentage, close_reason,
                 binance_order_id
             FROM positions 
@@ -195,12 +195,16 @@ def get_position_history():
             profit_pct = row['profit_percentage'] or 0
             quantity = row['quantity']
             
-            # Calculate exit price and PNL
-            if profit_pct and entry_price:
+            # Use actual exit_price if available (new records), otherwise calculate (old records)
+            exit_price = row.get('exit_price')
+            if not exit_price and profit_pct and entry_price:
+                # Fallback calculation for old records without exit_price
                 exit_price = entry_price * (1 + profit_pct / 100)
+            
+            # Calculate PNL in USDT
+            if exit_price and entry_price and quantity:
                 pnl_usdt = (exit_price - entry_price) * quantity
             else:
-                exit_price = None
                 pnl_usdt = None
             
             positions.append({
