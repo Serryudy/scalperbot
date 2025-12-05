@@ -35,8 +35,10 @@ TELEGRAM_CONFIG = {
 }
 
 BINANCE_CONFIG = {
-    'api_key': '9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ',
-    'api_secret': 'mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl'
+    # ⚠️ DEMO/TESTNET ACCOUNT - Temporary for testing
+    'api_key': 'NPCpHKP3Qi5GyEWlfknmrbipXXg6NbBULsfseqaDzsZ5LYjigQmydblIP9ZgvHs7',
+    'api_secret': 'dmZmE6NNzZcw6Dyx0blRlZYy1PziJccvUVUAjyPUsRyohc3cDttjdsbSNpyM5vXs',
+    'testnet': True  # Using testnet/demo environment
 }
 
 TRADING_CONFIG = {
@@ -419,8 +421,8 @@ class AISignalExtractor:
             return {"type": "ERROR", "reason": str(e)}
 
 class BinanceTrader:
-    def __init__(self, api_key, api_secret):
-        self.client = Client(api_key, api_secret)
+    def __init__(self, api_key, api_secret, testnet=False):
+        self.client = Client(api_key, api_secret, testnet=testnet)
         # Increase recvWindow to handle time sync issues (default is 5000ms, increase to 60000ms)
         self.client.timestamp_offset = 0
         self._sync_time_offset()
@@ -814,7 +816,8 @@ class ImprovedAITradingBot:
         self.db = MessageDatabase()
         self.trader = BinanceTrader(
             BINANCE_CONFIG['api_key'],
-            BINANCE_CONFIG['api_secret']
+            BINANCE_CONFIG['api_secret'],
+            testnet=BINANCE_CONFIG.get('testnet', False)
         )
         self.ai = AISignalExtractor(
             DEEPSEEK_CONFIG['api_key'],

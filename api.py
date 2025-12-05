@@ -26,9 +26,10 @@ CORS(app)  # Enable CORS for all routes
 DB_NAME = 'improved_trading_bot.db'
 
 # Binance client (for real-time price data)
-BINANCE_API_KEY = '9pkSF4J0rpXeVor9uDeqgAgMBTUdS0xqhomDxIOqYy0OMGAQMmj6d402yuLOJWQQ'
-BINANCE_API_SECRET = 'mIQHkxDQAOM58eRbrzTNqrCr0AQJGtmvEbZWXkiPgci8tfMV6bqLSCWCY3ymF8Xl'
-binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+# ⚠️ DEMO/TESTNET ACCOUNT - Temporary for testing
+BINANCE_API_KEY = 'NPCpHKP3Qi5GyEWlfknmrbipXXg6NbBULsfseqaDzsZ5LYjigQmydblIP9ZgvHs7'
+BINANCE_API_SECRET = 'dmZmE6NNzZcw6Dyx0blRlZYy1PziJccvUVUAjyPUsRyohc3cDttjdsbSNpyM5vXs'
+binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)  # Using testnet/demo
 
 def get_db_connection():
     """Get database connection"""
