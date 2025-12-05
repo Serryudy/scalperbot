@@ -13,7 +13,7 @@ import time
 class TradingBacktester:
     def __init__(self):
         self.db_path = 'improved_trading_bot.db'
-        self.client = Client(BINANCE_CONFIG['api_key'], BINANCE_CONFIG['api_secret'])
+        self.client = Client(BINANCE_CONFIG['api_key'], BINANCE_CONFIG['api_secret'], testnet=BINANCE_CONFIG.get('testnet', False))
         self.ai = AISignalExtractor(
             DEEPSEEK_CONFIG['api_key'],
             DEEPSEEK_CONFIG['base_url'],
