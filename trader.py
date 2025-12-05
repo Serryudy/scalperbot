@@ -43,11 +43,11 @@ BINANCE_CONFIG = {
 
 TRADING_CONFIG = {
     'leverage': 10,
-    'risk_percentage': 10,
+    'risk_percentage': 2,
     'fetch_interval': 60,  # 1 minute
     'lookback_hours': 24,
-    'max_open_positions': 5,  # Maximum 5 positions at once
-    'max_total_risk': 50,  # Maximum 50% of account at risk
+    'max_open_positions': 59,  # Maximum 5 positions at once
+    'max_total_risk': 10,  # Maximum 50% of account at risk
     'max_price_deviation_pct': 2,  # Maximum 2% price deviation (LONG: upper bound only, SHORT: lower bound only)
     'trailing_stop_enabled': True,
     'trailing_stop_activation': 20,  # Activate at 20% profit
