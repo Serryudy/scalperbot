@@ -1,0 +1,112 @@
+[
+    {
+        "id": 1,
+        "message_text": "🚀 #BNBUSDT LONG Entry: 692.50 - 695.00 TP: 720.00 - 750.00 SL: 680.00 Leverage: 10x Risk: 2% 📊 Strong bullish momentum on 4H chart. Breaking resistance. Good R:R ratio.",
+        "message_date": "2025-12-05T10:00:00Z",
+        "expected_action": "NEW_POSITION",
+        "description": "Open new LONG position"
+    },
+    {
+        "id": 2,
+        "message_text": "BNBUSDT looking good! Hold tight, we're targeting 720 next 💪",
+        "message_date": "2025-12-05T10:30:00Z",
+        "expected_action": "IGNORE/HOLD",
+        "description": "Encouraging hold message - should be ignored or marked as hold"
+    },
+    {
+        "id": 3,
+        "message_text": "Update BNB: Price is moving well. Move SL to entry to protect capital. Profit is around +3%",
+        "message_date": "2025-12-05T11:00:00Z",
+        "expected_action": "MOVE_SL_TO_ENTRY",
+        "description": "Move stop loss to entry (breakeven)"
+    },
+    {
+        "id": 4,
+        "message_text": "BNB Update: Nice pump! Close 25% and hold the rest. Current profit around +5%",
+        "message_date": "2025-12-05T11:30:00Z",
+        "expected_action": "CLOSE_PARTIAL",
+        "expected_percentage": 25,
+        "description": "Take 25% profit, hold remainder"
+    },
+    {
+        "id": 5,
+        "message_text": "BNBUSDT update: Facing resistance at 715. Close another 30% vol, hold rest for TP. Profit ~+7%",
+        "message_date": "2025-12-05T12:00:00Z",
+        "expected_action": "CLOSE_PARTIAL",
+        "expected_percentage": 30,
+        "description": "Close another 30% at resistance"
+    },
+    {
+        "id": 6,
+        "message_text": "⚠️ BNB Alert: Market looking uncertain. Protect your profits - close 40% now and let the rest run with SL at entry.",
+        "message_date": "2025-12-05T12:30:00Z",
+        "expected_action": "CLOSE_PARTIAL",
+        "expected_percentage": 40,
+        "description": "Risk management - close 40% due to uncertainty"
+    },
+    {
+        "id": 7,
+        "message_text": "BNBUSDT: TP1 hit at 720! Excellent trade everyone 🎯 Close remaining position and take profits. Final profit around +9%",
+        "message_date": "2025-12-05T13:00:00Z",
+        "expected_action": "CLOSE_FULL",
+        "description": "Take profit hit - close full remaining position"
+    },
+    {
+        "id": 8,
+        "message_text": "🔥 #ETHUSDT SHORT Entry: 3820.00 - 3830.00 TP: 3700.00 - 3650.00 SL: 3880.00 Leverage: 8x Risk: 2% 📉 Bearish divergence on 1H. Overbought conditions.",
+        "message_date": "2025-12-05T13:30:00Z",
+        "expected_action": "NEW_POSITION",
+        "description": "Open new SHORT position on ETH"
+    },
+    {
+        "id": 9,
+        "message_text": "ETH update: This is not nice, market bouncing back. Everyone close 50% vol then hold with tight SL",
+        "message_date": "2025-12-05T14:00:00Z",
+        "expected_action": "CLOSE_PARTIAL",
+        "expected_percentage": 50,
+        "description": "Bad performance - close 50% to reduce risk"
+    },
+    {
+        "id": 10,
+        "message_text": "ETHUSDT: Trade not going as planned. Price reversing. Close full position now before it gets worse. Small loss is better than big loss.",
+        "message_date": "2025-12-05T14:30:00Z",
+        "expected_action": "CLOSE_FULL",
+        "description": "Cut losses - close full position"
+    },
+    {
+        "id": 11,
+        "message_text": "Market update: Choppy conditions. Wait for clear signals before entering new trades. 📊",
+        "message_date": "2025-12-05T15:00:00Z",
+        "expected_action": "IGNORE",
+        "description": "General market commentary - should be ignored"
+    },
+    {
+        "id": 12,
+        "message_text": "Good morning traders! Remember to manage your risk and don't over-leverage. Trade safe! 💰",
+        "message_date": "2025-12-05T15:15:00Z",
+        "expected_action": "IGNORE",
+        "description": "General advice - should be ignored"
+    },
+    {
+        "id": 13,
+        "message_text": "🚀 #SOLUSDT LONG Entry: 98.50 - 99.00 TP: 105.00 - 108.00 SL: 96.00 Leverage: 12x Risk: 2% 🔥 SOL breaking out! Strong volume.",
+        "message_date": "2025-12-05T15:30:00Z",
+        "expected_action": "NEW_POSITION",
+        "description": "Open new LONG position on SOL"
+    },
+    {
+        "id": 14,
+        "message_text": "SOL Update: Moving SL to 99.5 (entry+1%) to secure some profit. Currently at +4%",
+        "message_date": "2025-12-05T16:00:00Z",
+        "expected_action": "MODIFY_SL",
+        "description": "Modify stop loss to new level"
+    },
+    {
+        "id": 15,
+        "message_text": "SOLUSDT: Close 34% vol and hold. Let's lock in some gains! Profit around +6%",
+        "message_date": "2025-12-05T16:30:00Z",
+        "expected_action": "CLOSE_PARTIAL",
+        "expected_percentage": 34,
+        "description": "Close 34% partial as requested"
+    }
+]
