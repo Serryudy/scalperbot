@@ -737,7 +737,9 @@ class BinanceTrader:
             positions = self.client.futures_position_information(symbol=symbol)
             
             for pos in positions:
-                if pos['symbol'] == symbol and float(pos['positionAmt']) != 0:
+                position_amt = float(pos['positionAmt'])
+                
+                if pos['symbol'] == symbol and position_amt != 0:
                     total_qty = abs(float(pos['positionAmt']))
                     entry_price = float(pos['entryPrice'])
                     
@@ -755,9 +757,16 @@ class BinanceTrader:
                         logger.info(f"Closing full position {symbol}: {qty} units")
                         self.client.futures_cancel_all_open_orders(symbol=symbol)
                     
+                    # CRITICAL: Determine order side based on position direction
+                    # LONG position (positive amt) -> SELL to close
+                    # SHORT position (negative amt) -> BUY to close
+                    order_side = SIDE_SELL if position_amt > 0 else SIDE_BUY
+                    
+                    logger.info(f"🔄 Executing {order_side} order for {qty} units...")
+                    
                     order = self.client.futures_create_order(
                         symbol=symbol,
-                        side=SIDE_SELL,
+                        side=order_side,
                         type=ORDER_TYPE_MARKET,
                         quantity=qty
                     )
