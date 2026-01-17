@@ -1,0 +1,20 @@
+# Requirements for trader.py and related files
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# Or with pip3:
+#   pip3 install -r requirements.txt
+
+# Telegram client library
+telethon>=1.34.0
+
+# Binance API client
+python-binance>=1.0.19
+
+# HTTP requests library (for DeepSeek API)
+requests>=2.31.0
+
+# Data analysis libraries (used in scheme.py)
+pandas>=2.0.0
+numpy>=1.24.0
