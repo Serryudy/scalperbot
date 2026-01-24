@@ -1,3 +1,7 @@
+python-dotenv
+Telethon
+python-binance
+requests
 # Requirements for trader.py and related files
 #
 # Installation:

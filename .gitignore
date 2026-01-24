@@ -22,3 +22,6 @@ venv/
 env/
 
 /frontend
+
+# Environment Variables
+.env

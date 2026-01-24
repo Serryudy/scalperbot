@@ -1,6 +1,11 @@
 from telethon import TelegramClient
 import asyncio
 import sqlite3
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 from datetime import datetime, timedelta, timezone
 import logging
 import json
@@ -27,27 +32,26 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 TELEGRAM_CONFIG = {
-    'api_id': 23008284,
-    'api_hash': '9b753f6de26369ddff1f498ce4d21fb5',
-    'phone': '+94781440205',
-    'group_ids': [-1002529586843, -1001573488012],  # Multiple groups to monitor
+    'api_id': int(os.getenv('TELEGRAM_API_ID', '0')),
+    'api_hash': os.getenv('TELEGRAM_API_HASH', ''),
+    'phone': os.getenv('TELEGRAM_PHONE', ''),
+    'group_ids': [int(gid) for gid in os.getenv('TELEGRAM_GROUP_IDS', '').split(',') if gid],
     #'topic_id': 40011
 }
 
 BINANCE_CONFIG = {
-    # ⚠️ DEMO/TESTNET ACCOUNT - Temporary for testing
-    'api_key': 'NPCpHKP3Qi5GyEWlfknmrbipXXg6NbBULsfseqaDzsZ5LYjigQmydblIP9ZgvHs7',
-    'api_secret': 'dmZmE6NNzZcw6Dyx0blRlZYy1PziJccvUVUAjyPUsRyohc3cDttjdsbSNpyM5vXs',
-    'testnet': True  # Using testnet/demo environment
+    'api_key': os.getenv('BINANCE_API_KEY', ''),
+    'api_secret': os.getenv('BINANCE_API_SECRET', ''),
+    'testnet': os.getenv('BINANCE_TESTNET', 'True').lower() == 'true'
 }
 
 TRADING_CONFIG = {
     'leverage': 10,
-    'risk_percentage': 10,
+    'risk_percentage': 2,
     'fetch_interval': 60,  # 1 minute
     'lookback_hours': 24,
-    'max_open_positions': 5,  # Maximum 5 positions at once
-    'max_total_risk': 50,  # Maximum 50% of account at risk
+    'max_open_positions': 59,  # Maximum 5 positions at once
+    'max_total_risk': 10,  # Maximum 50% of account at risk
     'max_price_deviation_pct': 2,  # Maximum 2% price deviation (LONG: upper bound only, SHORT: lower bound only)
     'trailing_stop_enabled': True,
     'trailing_stop_activation': 20,  # Activate at 20% profit
@@ -61,21 +65,77 @@ TRADING_CONFIG = {
 }
 
 DEEPSEEK_CONFIG = {
-    'api_key': 'sk-abaae5d245c64f899a1302208cc671b1',
-    'base_url': 'https://api.deepseek.com/v1',
-    'model': 'deepseek-chat'
+    'api_key': os.getenv('DEEPSEEK_API_KEY', ''),
+    'base_url': os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
+    'model': os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
 }
 
 EMAIL_CONFIG = {
-    'enabled': True,
-    'to_email': 'somapalagalagedara@gmail.com',
-    'from_email': 'somapalagalagedara@gmail.com',
-    'smtp_server': 'smtp.gmail.com',
-    'smtp_port': 587,
-    'password': 'gmsq cxug zkhv jtik'
+    'enabled': os.getenv('EMAIL_ENABLED', 'True').lower() == 'true',
+    'to_email': os.getenv('EMAIL_TO', ''),
+    'from_email': os.getenv('EMAIL_FROM', ''),
+    'smtp_server': os.getenv('EMAIL_SMTP_SERVER', 'smtp.gmail.com'),
+    'smtp_port': int(os.getenv('EMAIL_SMTP_PORT', '587')),
+    'password': os.getenv('EMAIL_PASSWORD', '')
 }
 
+
+# -----------------------------------------------------------------------------
+# 🚨 Critical Error Alerting System
+# -----------------------------------------------------------------------------
+import traceback
+
+def send_email_alert(subject, body):
+    """Send an email alert using configured SMTP settings"""
+    if not EMAIL_CONFIG['enabled']:
+        return
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_CONFIG['from_email']
+        msg['To'] = EMAIL_CONFIG['to_email']
+        msg['Subject'] = subject
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+        server.starttls()
+        server.login(EMAIL_CONFIG['from_email'], EMAIL_CONFIG['password'])
+        text = msg.as_string()
+        server.sendmail(EMAIL_CONFIG['from_email'], EMAIL_CONFIG['to_email'], text)
+        server.quit()
+        logger.info(f"📧 Alert email sent: {subject}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send alert email: {e}")
+
+def handle_critical_error(context, error):
+    """Handle critical errors by logging and emailing details"""
+    error_msg = f"{str(error)}"
+    tb = traceback.format_exc()
+    
+    log_msg = f"CRITICAL ERROR in {context}: {error_msg}"
+    logger.error(log_msg, exc_info=True)
+    
+    email_subject = f"🚨 CRITICAL: Trading Bot Error in {context}"
+    email_body = f"""
+CRITICAL ERROR REPORT
+=====================
+Context: {context}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Error: {error_msg}
+
+Traceback:
+----------
+{tb}
+
+Please check the server immediately.
+"""
+    send_email_alert(email_subject, email_body)
+
+# -----------------------------------------------------------------------------
+
 class MessageDatabase:
+
     def __init__(self, db_name='improved_trading_bot.db'):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.create_tables()
@@ -702,7 +762,7 @@ class BinanceTrader:
             }
             
         except Exception as e:
-            logger.error(f"❌ Error opening position: {e}")
+            handle_critical_error(f"Open Long Position ({signal.get('symbol', 'UNKNOWN')})", e)
             return None    
     def transfer_to_spot_wallet(self, amount):
         """Transfer USDT from futures wallet to spot wallet"""
@@ -1735,17 +1795,21 @@ Position closed instead of holding per configuration.
                 await self.process_messages()
                 
             except Exception as e:
-                logger.error(f"❌ Error in main loop: {e}", exc_info=True)
+                handle_critical_error("Main Loop", e)
+                # Prevent rapid error looping
+                await asyncio.sleep(60)
             
             logger.info(f"\n⏳ Sleeping for {TRADING_CONFIG['fetch_interval']} seconds...\n")
             await asyncio.sleep(TRADING_CONFIG['fetch_interval'])
 
 async def main():
-    bot = ImprovedAITradingBot()
     try:
+        bot = ImprovedAITradingBot()
         await bot.run()
     except KeyboardInterrupt:
         logger.info("\n\n👋 Bot stopped by user")
+    except Exception as e:
+        handle_critical_error("Bot Startup/Fatal Error", e)
 
 if __name__ == '__main__':
     asyncio.run(main())
