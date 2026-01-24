@@ -1,0 +1,25 @@
+[Unit]
+Description=Improved AI Trading Bot
+After=network.target
+
+[Service]
+# CHANGE THIS to your username if not root
+User=root
+Group=root
+
+# CHANGE THIS to the directory where your bot code is
+WorkingDirectory=/root/scalperbot
+
+# CHANGE THIS to point to your python executable and trader.py
+# If using a virtual environment: /path/to/venv/bin/python
+ExecStart=/root/scalperbot/venv/bin/python /root/scalperbot/trader.py
+
+# Auto-restart if it crashes
+Restart=always
+RestartSec=10
+
+# Environment variables (optional, since we use .env file now)
+# Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
