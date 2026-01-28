@@ -12,7 +12,7 @@ from trader import (
     BinanceTrader, 
     MessageDatabase,
     BINANCE_CONFIG,
-    DEEPSEEK_CONFIG
+    GOOGLE_CONFIG
 )
 import logging
 import asyncio
@@ -33,9 +33,9 @@ class TestRunner:
             testnet=BINANCE_CONFIG.get('testnet', False)
         )
         self.ai = AISignalExtractor(
-            DEEPSEEK_CONFIG['api_key'],
-            DEEPSEEK_CONFIG['base_url'],
-            DEEPSEEK_CONFIG['model']
+            GOOGLE_CONFIG['api_key'],
+            GOOGLE_CONFIG['base_url'],
+            GOOGLE_CONFIG['model']
         )
         
     def load_test_messages(self):

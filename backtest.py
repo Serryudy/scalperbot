@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from binance.client import Client
 import json
-from trader import AISignalExtractor, BINANCE_CONFIG, DEEPSEEK_CONFIG
+from trader import AISignalExtractor, BINANCE_CONFIG, GOOGLE_CONFIG
 import time
 
 class TradingBacktester:
@@ -15,9 +15,9 @@ class TradingBacktester:
         self.db_path = 'improved_trading_bot.db'
         self.client = Client(BINANCE_CONFIG['api_key'], BINANCE_CONFIG['api_secret'], testnet=BINANCE_CONFIG.get('testnet', False))
         self.ai = AISignalExtractor(
-            DEEPSEEK_CONFIG['api_key'],
-            DEEPSEEK_CONFIG['base_url'],
-            DEEPSEEK_CONFIG['model']
+            GOOGLE_CONFIG['api_key'],
+            GOOGLE_CONFIG['base_url'],
+            GOOGLE_CONFIG['model']
         )
         
     def get_all_messages(self):
