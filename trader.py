@@ -64,10 +64,10 @@ TRADING_CONFIG = {
     'auto_profit_threshold': 10  # Fully close position when profit >= 10%
 }
 
-DEEPSEEK_CONFIG = {
-    'api_key': os.getenv('DEEPSEEK_API_KEY', ''),
-    'base_url': os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
-    'model': os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
+GOOGLE_CONFIG = {
+    'api_key': os.getenv('GOOGLE_API_KEY', ''),
+    'base_url': os.getenv('GOOGLE_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai'),
+    'model': os.getenv('GOOGLE_MODEL', 'gemini-1.5-flash')
 }
 
 EMAIL_CONFIG = {
@@ -431,53 +431,39 @@ class MessageDatabase:
 class AISignalExtractor:
     def __init__(self, api_key, base_url, model):
         self.api_key = api_key
-        self.base_url = base_url
+        self.base_url = base_url  # Not used with SDK but kept for compatibility
         self.model = model
+        
+        # Initialize Google Gemini client
+        from google import genai
+        self.client = genai.Client(api_key=api_key)
     
     def analyze_message(self, message_text):
         system_prompt = get_enhanced_ai_prompt()
-
         user_prompt = f"Analyze this trading message:\n\n{message_text}"
         
         try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 500
-                },
-                timeout=30
+            # Use the official Google Gemini SDK
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=f"{system_prompt}\n\n{user_prompt}"
             )
             
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content'].strip()
-                
-                # Clean markdown
-                if content.startswith('```json'):
-                    content = content[7:]
-                if content.startswith('```'):
-                    content = content[3:]
-                if content.endswith('```'):
-                    content = content[:-3]
-                content = content.strip()
-                
-                return json.loads(content)
-            else:
-                logger.error(f"DeepSeek API error: {response.status_code}")
-                return {"type": "ERROR", "reason": f"API error: {response.status_code}"}
-                
+            content = response.text.strip()
+            
+            # Clean markdown
+            if content.startswith('```json'):
+                content = content[7:]
+            if content.startswith('```'):
+                content = content[3:]
+            if content.endswith('```'):
+                content = content[:-3]
+            content = content.strip()
+            
+            return json.loads(content)
+            
         except Exception as e:
-            logger.error(f"Error calling DeepSeek API: {e}")
+            logger.error(f"Error calling Google Gemini API: {e}")
             return {"type": "ERROR", "reason": str(e)}
 
 class BinanceTrader:
@@ -889,9 +875,9 @@ class ImprovedAITradingBot:
             testnet=BINANCE_CONFIG.get('testnet', False)
         )
         self.ai = AISignalExtractor(
-            DEEPSEEK_CONFIG['api_key'],
-            DEEPSEEK_CONFIG['base_url'],
-            DEEPSEEK_CONFIG['model']
+            GOOGLE_CONFIG['api_key'],
+            GOOGLE_CONFIG['base_url'],
+            GOOGLE_CONFIG['model']
         )
     
     def send_email_notification(self, subject, message):
@@ -1719,6 +1705,17 @@ Position closed instead of holding per configuration.
         logger.info(f"📬 Found {len(unprocessed)} unprocessed messages")
         
         for msg_id, msg_text, msg_date in unprocessed:
+            # OPTIMIZATION: Simple keyword filter to save API calls (Gemini Free Tier has limits)
+            # Only analyze messages that contain trading-related keywords
+            keywords = ["BUY", "SELL", "LONG", "SHORT", "ENTRY", "TP", "SL", "STOP", "TARGET", "USDT", "$", "PROFIT", "CLOSE", "LEVERAGE"]
+            is_potential_trade = any(keyword in msg_text.upper() for keyword in keywords)
+            
+            # If no keywords found, skip AI analysis to save quota
+            if not is_potential_trade:
+                logger.info(f"⏭️ Skipping non-trading message (no keywords): {msg_text[:50]}...")
+                # Mark as processed so we don't fetch it again
+                self.db.mark_message_processed(msg_id, 'IGNORE', json.dumps({'type': 'IGNORE', 'reason': 'Keyword filter skipped'}))
+                continue
             logger.info(f"\n{'='*80}")
             logger.info(f"🔍 Analyzing message {msg_id} from {msg_date}")
             logger.info(f"📝 Content: {msg_text[:100]}...")
